@@ -1,0 +1,23 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: controller
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/objectstore}
+    username: ${DB_USER:store}
+    password: ${DB_PASS:store}
+  jpa:
+    hibernate:
+      ddl-auto: update
+    open-in-view: false
+  servlet:
+    multipart:
+      max-file-size: 2GB
+      max-request-size: 2GB
+
+store:
+  chunk-size: 1048576
+  replication-factor: 2
+  heartbeat-timeout-ms: 10000

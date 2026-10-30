@@ -1,0 +1,13 @@
+server:
+  port: 8081
+
+spring:
+  application:
+    name: worker
+
+worker:
+  id: ${WORKER_ID:worker1}
+  advertised-url: ${WORKER_URL:http://localhost:8081}
+  data-dir: ${DATA_DIR:/data/chunks}
+  controller-url: ${CONTROLLER_URL:http://localhost:8080}
+  heartbeat-interval-ms: 3000
