@@ -1,0 +1,124 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: postgres
+    environment:
+      POSTGRES_DB: objectstore
+      POSTGRES_USER: store
+      POSTGRES_PASSWORD: store
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U store -d objectstore"]
+      interval: 3s
+      timeout: 5s
+      retries: 5
+    networks:
+      - objectstore-net
+
+  controller:
+    build:
+      context: .
+      dockerfile: controller/Dockerfile
+    container_name: controller
+    ports:
+      - "${CONTROLLER_PORT:-8082}:8080"
+    environment:
+      DB_URL: jdbc:postgresql://postgres:5432/objectstore
+      DB_USER: store
+      DB_PASS: store
+      STORE_CHUNK_SIZE: 1048576
+      STORE_REPLICATION_FACTOR: 2
+      STORE_HEARTBEAT_TIMEOUT_MS: 10000
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - objectstore-net
+
+  worker1:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    container_name: worker1
+    environment:
+      WORKER_ID: worker1
+      WORKER_URL: http://worker1:8081
+      CONTROLLER_URL: http://controller:8080
+      DATA_DIR: /data/chunks
+      worker.heartbeat-interval-ms: 3000
+    volumes:
+      - worker1-data:/data/chunks
+    depends_on:
+      - controller
+    networks:
+      - objectstore-net
+
+  worker2:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    container_name: worker2
+    environment:
+      WORKER_ID: worker2
+      WORKER_URL: http://worker2:8081
+      CONTROLLER_URL: http://controller:8080
+      DATA_DIR: /data/chunks
+      worker.heartbeat-interval-ms: 3000
+    volumes:
+      - worker2-data:/data/chunks
+    depends_on:
+      - controller
+    networks:
+      - objectstore-net
+
+  worker3:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    container_name: worker3
+    environment:
+      WORKER_ID: worker3
+      WORKER_URL: http://worker3:8081
+      CONTROLLER_URL: http://controller:8080
+      DATA_DIR: /data/chunks
+      worker.heartbeat-interval-ms: 3000
+    volumes:
+      - worker3-data:/data/chunks
+    depends_on:
+      - controller
+    networks:
+      - objectstore-net
+
+  worker4:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    container_name: worker4
+    environment:
+      WORKER_ID: worker4
+      WORKER_URL: http://worker4:8081
+      CONTROLLER_URL: http://controller:8080
+      DATA_DIR: /data/chunks
+      worker.heartbeat-interval-ms: 3000
+    volumes:
+      - worker4-data:/data/chunks
+    depends_on:
+      - controller
+    networks:
+      - objectstore-net
+
+volumes:
+  postgres-data:
+  worker1-data:
+  worker2-data:
+  worker3-data:
+  worker4-data:
+
+networks:
+  objectstore-net:
+    driver: bridge

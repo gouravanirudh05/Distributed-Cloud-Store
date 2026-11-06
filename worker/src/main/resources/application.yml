@@ -1,5 +1,5 @@
 server:
-  port: 8081
+  port: ${PORT:8081}
 
 spring:
   application:
@@ -10,4 +10,4 @@ worker:
   advertised-url: ${WORKER_URL:http://localhost:8081}
   data-dir: ${DATA_DIR:/data/chunks}
   controller-url: ${CONTROLLER_URL:http://localhost:8080}
-  heartbeat-interval-ms: 3000
+  heartbeat-interval-ms: ${WORKER_HEARTBEAT_INTERVAL_MS:3000}
