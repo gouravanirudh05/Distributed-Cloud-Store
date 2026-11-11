@@ -1,6 +1,27 @@
-version: '3.8'
+# Mini Distributed Cloud Object Store: 1 controller, 4 workers, 2 clients (CLI + web UI).
+# Start:  docker compose up -d --build
+# Web UI: http://localhost:3000     REST API: http://localhost:8082/api/v1/objects
+name: distributed-cloud-store
+
+x-worker: &worker
+  build:
+    context: .
+    dockerfile: worker/Dockerfile
+  image: objectstore-worker:latest
+  depends_on:
+    controller:
+      condition: service_healthy
+  healthcheck:
+    test: ["CMD", "curl", "-fs", "http://localhost:8081/actuator/health"]
+    interval: 5s
+    timeout: 3s
+    retries: 30
+    start_period: 10s
+  networks:
+    - objectstore-net
 
 services:
+  # Metadata store used by the controller (objects, chunks, replica locations, workers, events)
   postgres:
     image: postgres:15-alpine
     container_name: postgres
@@ -16,7 +37,7 @@ services:
       test: ["CMD-SHELL", "pg_isready -U store -d objectstore"]
       interval: 3s
       timeout: 5s
-      retries: 5
+      retries: 10
     networks:
       - objectstore-net
 
@@ -24,6 +45,7 @@ services:
     build:
       context: .
       dockerfile: controller/Dockerfile
+    image: objectstore-controller:latest
     container_name: controller
     ports:
       - "${CONTROLLER_PORT:-8082}:8080"
@@ -34,79 +56,93 @@ services:
       STORE_CHUNK_SIZE: 1048576
       STORE_REPLICATION_FACTOR: 2
       STORE_HEARTBEAT_TIMEOUT_MS: 10000
+      STORE_RE_REPLICATION_GRACE_MS: ${RE_REPLICATION_GRACE_MS:-30000}
+      STORE_SCRUB_INTERVAL_MS: ${SCRUB_INTERVAL_MS:-60000}
     depends_on:
       postgres:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:8080/actuator/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 15s
     networks:
       - objectstore-net
 
   worker1:
-    build:
-      context: .
-      dockerfile: worker/Dockerfile
+    <<: *worker
     container_name: worker1
     environment:
       WORKER_ID: worker1
       WORKER_URL: http://worker1:8081
       CONTROLLER_URL: http://controller:8080
       DATA_DIR: /data/chunks
-      worker.heartbeat-interval-ms: 3000
+      WORKER_HEARTBEAT_INTERVAL_MS: 3000
     volumes:
       - worker1-data:/data/chunks
-    depends_on:
-      - controller
-    networks:
-      - objectstore-net
 
   worker2:
-    build:
-      context: .
-      dockerfile: worker/Dockerfile
+    <<: *worker
     container_name: worker2
     environment:
       WORKER_ID: worker2
       WORKER_URL: http://worker2:8081
       CONTROLLER_URL: http://controller:8080
       DATA_DIR: /data/chunks
-      worker.heartbeat-interval-ms: 3000
+      WORKER_HEARTBEAT_INTERVAL_MS: 3000
     volumes:
       - worker2-data:/data/chunks
-    depends_on:
-      - controller
-    networks:
-      - objectstore-net
 
   worker3:
-    build:
-      context: .
-      dockerfile: worker/Dockerfile
+    <<: *worker
     container_name: worker3
     environment:
       WORKER_ID: worker3
       WORKER_URL: http://worker3:8081
       CONTROLLER_URL: http://controller:8080
       DATA_DIR: /data/chunks
-      worker.heartbeat-interval-ms: 3000
+      WORKER_HEARTBEAT_INTERVAL_MS: 3000
     volumes:
       - worker3-data:/data/chunks
-    depends_on:
-      - controller
-    networks:
-      - objectstore-net
 
   worker4:
-    build:
-      context: .
-      dockerfile: worker/Dockerfile
+    <<: *worker
     container_name: worker4
     environment:
       WORKER_ID: worker4
       WORKER_URL: http://worker4:8081
       CONTROLLER_URL: http://controller:8080
       DATA_DIR: /data/chunks
-      worker.heartbeat-interval-ms: 3000
+      WORKER_HEARTBEAT_INTERVAL_MS: 3000
     volumes:
       - worker4-data:/data/chunks
+
+  # Client 1: command-line client.  docker exec -it client objstore help
+  client:
+    build:
+      context: .
+      dockerfile: client/Dockerfile
+    image: objectstore-client:latest
+    container_name: client
+    environment:
+      OBJSTORE_URL: http://controller:8080
+    volumes:
+      - ./files:/files
+    depends_on:
+      controller:
+        condition: service_healthy
+    networks:
+      - objectstore-net
+
+  # Client 2: browser UI (nginx serves the page and proxies /api to the controller)
+  web:
+    build:
+      context: ./web
+    image: objectstore-web:latest
+    container_name: web
+    ports:
+      - "${WEB_PORT:-3000}:80"
     depends_on:
       - controller
     networks:

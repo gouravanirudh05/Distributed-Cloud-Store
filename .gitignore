@@ -36,3 +36,7 @@ demo-output/
 .idea/
 .vscode/
 *.iml
+
+# Files shared with the client container (keep the folder)
+files/*
+!files/.gitkeep

@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Object Store Console</title>
+  <link rel="stylesheet" href="style.css">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect x='1' y='2' width='14' height='4' rx='1' fill='%232563eb'/%3E%3Crect x='1' y='7' width='14' height='4' rx='1' fill='%233b82f6'/%3E%3Crect x='1' y='12' width='14' height='3' rx='1' fill='%2393c5fd'/%3E%3C/svg%3E">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo" aria-hidden="true"></span>
+    <div>
+      <h1>Object Store Console</h1>
+      <p class="sub">1 controller · 4 workers · 1 MB chunks · replication factor <span id="rf">2</span></p>
+    </div>
+  </div>
+  <div class="health">
+    <span class="label">Cluster</span>
+    <span id="cluster-status" class="pill neutral">loading…</span>
+  </div>
+</header>
+
+<main>
+  <section aria-labelledby="workers-h">
+    <div class="section-head">
+      <h2 id="workers-h">Workers</h2>
+      <span class="hint">live heartbeat view · refreshes every 2 s</span>
+    </div>
+    <div id="workers" class="workers"></div>
+    <p id="replication-line" class="replication-line"></p>
+  </section>
+
+  <div class="grid">
+    <div class="col">
+      <section class="card" aria-labelledby="upload-h">
+        <h2 id="upload-h">Upload object</h2>
+        <form id="upload-form">
+          <label class="drop" id="drop">
+            <input type="file" id="file" name="file" required>
+            <span id="drop-text">Choose a file or drop it here</span>
+          </label>
+          <div class="meta-editor" id="upload-meta"></div>
+          <div class="row">
+            <button type="button" class="ghost" id="add-upload-meta">+ metadata</button>
+            <button type="submit" class="primary" id="upload-btn">Upload</button>
+          </div>
+          <div class="progress" hidden id="progress"><div id="progress-bar"></div></div>
+        </form>
+      </section>
+
+      <section class="card" aria-labelledby="objects-h">
+        <div class="section-head">
+          <h2 id="objects-h">Objects</h2>
+          <span class="hint" id="objects-count"></span>
+        </div>
+        <div class="table-wrap">
+          <table class="objects">
+            <thead><tr><th>Name</th><th>Size</th><th>Type</th><th class="num">Chunks</th><th>Created</th></tr></thead>
+            <tbody id="objects-body"></tbody>
+          </table>
+        </div>
+        <div class="pager">
+          <button class="ghost" id="prev">‹ Prev</button>
+          <span id="page-label"></span>
+          <button class="ghost" id="next">Next ›</button>
+        </div>
+      </section>
+    </div>
+
+    <div class="col">
+      <section class="card" aria-labelledby="integrity-h">
+        <div class="section-head">
+          <h2 id="integrity-h">Integrity</h2>
+          <button class="primary small" id="scrub-btn">Run integrity scan</button>
+        </div>
+        <p class="hint">Every chunk copy is re-hashed on its worker and compared with the SHA-256 recorded at upload. Bad copies are rewritten from a valid replica.</p>
+        <p id="scrub-result" class="scrub-result"></p>
+      </section>
+
+      <section class="card events-card" aria-labelledby="events-h">
+        <div class="section-head">
+          <h2 id="events-h">Cluster events</h2>
+          <span class="hint">newest first</span>
+        </div>
+        <ol id="events" class="events"></ol>
+      </section>
+    </div>
+  </div>
+</main>
+
+<aside id="detail" class="detail" hidden aria-labelledby="detail-name">
+  <div class="detail-inner">
+    <div class="detail-head">
+      <div>
+        <h2 id="detail-name"></h2>
+        <code id="detail-id" class="muted"></code>
+      </div>
+      <button class="ghost" id="close-detail" aria-label="Close">✕</button>
+    </div>
+    <div class="row actions">
+      <a class="primary button" id="download-link" href="#">Download</a>
+      <button class="danger" id="delete-btn">Delete</button>
+    </div>
+
+    <h3>System metadata</h3>
+    <dl id="sysmeta" class="kv"></dl>
+
+    <h3>Custom metadata <span class="hint">(edit without re-uploading)</span></h3>
+    <div class="meta-editor" id="detail-meta"></div>
+    <div class="row">
+      <button class="ghost" id="add-detail-meta">+ key</button>
+      <button class="primary" id="save-meta">Save metadata</button>
+    </div>
+
+    <h3>Chunk placement <span class="hint" id="chunk-summary"></span></h3>
+    <div class="table-wrap">
+      <table class="chunkmap" id="chunkmap"></table>
+    </div>
+    <p class="legend"><span class="cell on"></span> copy on live worker <span class="cell off"></span> copy on unavailable worker</p>
+  </div>
+</aside>
+
+<div id="toast" class="toast" role="status" aria-live="polite"></div>
+<script src="app.js"></script>
+</body>
+</html>
