@@ -41,7 +41,7 @@ public class WorkerHealthMonitor {
                         "Worker %s marked DOWN: no heartbeat for %ds. %d chunk copies on it are unavailable; reads use "
                                 + "the other copies. Its chunks will be re-replicated at %s if it has not returned.",
                         node.getId(), Duration.between(node.getLastHeartbeat(), now).toSeconds(), replicas,
-                        now.plus(props.reReplicationGrace())));
+                        now.plus(props.reReplicationGrace()).truncatedTo(java.time.temporal.ChronoUnit.SECONDS)));
             }
         }
     }

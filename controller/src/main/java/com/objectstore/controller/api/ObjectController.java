@@ -58,8 +58,11 @@ public class ObjectController {
         response.setStatus(HttpServletResponse.SC_OK);
         response.setContentType(safeContentType(plan.contentType()));
         response.setContentLengthLong(plan.size());
-        response.setHeader(HttpHeaders.CONTENT_DISPOSITION,
-                ContentDisposition.attachment().filename(plan.name(), StandardCharsets.UTF_8).build().toString());
+        boolean ascii = StandardCharsets.US_ASCII.newEncoder().canEncode(plan.name());
+        ContentDisposition disposition = ascii
+                ? ContentDisposition.attachment().filename(plan.name()).build()
+                : ContentDisposition.attachment().filename(plan.name(), StandardCharsets.UTF_8).build();
+        response.setHeader(HttpHeaders.CONTENT_DISPOSITION, disposition.toString());
         response.setHeader(HttpHeaders.ETAG, "\"" + plan.checksum() + "\"");
         response.setHeader("X-Object-Id", plan.objectId());
         response.setHeader("X-Checksum-SHA256", plan.checksum());

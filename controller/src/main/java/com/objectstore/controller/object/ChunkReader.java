@@ -44,17 +44,19 @@ public class ChunkReader {
                     if (actual.equalsIgnoreCase(chunk.checksum()) && ok.data().length == chunk.size()) {
                         return Optional.of(new ReadResult(ok.data(), r.workerId()));
                     }
+                    if (repairs.isSuppressed(chunk.id(), r.workerId())) continue; // already known to be unrepairable
                     events.chunk(EventType.CHUNK_CORRUPTED, r.workerId(), chunk.id(), String.format(
-                            "Corrupted replica of chunk %d on %s detected during %s: expected sha256 %s, got %s. "
-                                    + "Copy rejected, trying next replica; repair scheduled.",
-                            chunk.index(), r.workerId(), context, Checksums.shortHash(chunk.checksum()),
+                            "Corrupted copy of %s on %s detected during %s: expected sha256 %s, got %s. "
+                                    + "Copy rejected (not returned), trying next replica; repair scheduled.",
+                            chunk.label(), r.workerId(), context, Checksums.shortHash(chunk.checksum()),
                             Checksums.shortHash(actual)));
                     repairs.submit(chunk.id(), r.workerId(), "corrupted");
                 }
                 case Missing m -> {
+                    if (repairs.isSuppressed(chunk.id(), r.workerId())) continue;
                     events.chunk(EventType.CHUNK_MISSING, r.workerId(), chunk.id(), String.format(
-                            "Replica of chunk %d is missing on %s (found during %s); trying next replica; repair scheduled.",
-                            chunk.index(), r.workerId(), context));
+                            "Copy of %s is missing on %s (found during %s); trying next replica; repair scheduled.",
+                            chunk.label(), r.workerId(), context));
                     repairs.submit(chunk.id(), r.workerId(), "missing");
                 }
                 case Unreachable u -> log.warn("Chunk {} replica on {} unreachable during {}: {}",

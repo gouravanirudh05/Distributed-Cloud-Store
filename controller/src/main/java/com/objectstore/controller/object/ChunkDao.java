@@ -15,7 +15,12 @@ import java.util.*;
 @Repository
 public class ChunkDao {
 
-    public record ChunkRow(String id, String objectId, int index, int size, String checksum) {}
+    public record ChunkRow(String id, String objectId, int index, int size, String checksum) {
+        /** e.g. "chunk 3 of object 3f1c2b4a" (for log/event messages). */
+        public String label() {
+            return "chunk " + index + " of object " + (objectId.length() > 8 ? objectId.substring(0, 8) : objectId);
+        }
+    }
 
     public record ReplicaRow(long id, String chunkId, String workerId, Instant createdAt,
                              WorkerStatus workerStatus, String workerUrl, Instant workerDownSince) {

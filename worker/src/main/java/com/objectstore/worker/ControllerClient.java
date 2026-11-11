@@ -51,7 +51,7 @@ public class ControllerClient {
     @EventListener(ApplicationReadyEvent.class)
     public void onStartup() {
         log.info("Worker {} storing chunks in {}", workerId, store.getDataDir());
-        register();
+        if (!registered) register();
     }
 
     @Scheduled(fixedDelayString = "${worker.heartbeat-interval-ms}")
@@ -72,7 +72,8 @@ public class ControllerClient {
         }
     }
 
-    private void register() {
+    private synchronized void register() {
+        if (registered) return;
         try {
             http.post().uri("/internal/workers/register")
                     .body(payload())

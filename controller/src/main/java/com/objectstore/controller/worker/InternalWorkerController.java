@@ -77,7 +77,8 @@ public class InternalWorkerController {
         if (before.get().getStatus() == WorkerStatus.DOWN) {
             events.worker(EventType.WORKER_RECOVERING, req.workerId(), String.format(
                     "Heartbeat received from %s again after being DOWN since %s; verifying its chunks before marking UP",
-                    req.workerId(), before.get().getDownSince()));
+                    req.workerId(), before.get().getDownSince() == null ? "?"
+                            : before.get().getDownSince().truncatedTo(java.time.temporal.ChronoUnit.SECONDS)));
             maintenance.triggerSoon();
         }
         return ResponseEntity.ok(Map.of("ok", true));

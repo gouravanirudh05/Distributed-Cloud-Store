@@ -43,6 +43,7 @@ public class ReplicationManager {
     private final ChunkPlacementService placement;
     private final EventLog events;
     private final StoreProperties props;
+    private final RepairQueue repairQueue;
 
     private final Set<String> reportedWaiting = new HashSet<>();
     private final Set<String> reportedUnavailable = new HashSet<>();
@@ -52,7 +53,7 @@ public class ReplicationManager {
 
     public ReplicationManager(ChunkDao chunks, WorkerRepository workers, WorkerClientService workerClient,
                               ChunkReader reader, ChunkPlacementService placement, EventLog events,
-                              StoreProperties props) {
+                              StoreProperties props, RepairQueue repairQueue) {
         this.chunks = chunks;
         this.workers = workers;
         this.workerClient = workerClient;
@@ -60,6 +61,7 @@ public class ReplicationManager {
         this.placement = placement;
         this.events = events;
         this.props = props;
+        this.repairQueue = repairQueue;
     }
 
     /** One pass over all chunks whose live-copy count differs from RF. */
@@ -107,8 +109,8 @@ public class ReplicationManager {
                 case Unavailable u -> {
                     if (reportedUnavailable.add(chunkId)) {
                         events.chunk(EventType.CHUNK_UNAVAILABLE, null, chunkId, String.format(
-                                "Chunk %d has no copy on any live worker (copies on: %s); it is unreadable until one returns",
-                                chunk.get().index(), describe(replicas)));
+                                "%s has no copy on any live worker (copies on: %s); it is unreadable until one returns",
+                                capital(chunk.get().label()), describe(replicas)));
                     }
                 }
                 case Replicate r -> replicated += reReplicate(chunk.get(), replicas, r, ctx);
@@ -119,7 +121,7 @@ public class ReplicationManager {
                     "%d chunk(s) are under-replicated (fewer than %d live copies) because %s %s unavailable; "
                             + "they are still readable from the remaining copy. Re-replication starts at %s unless %s back.",
                     newlyWaiting, rf, String.join(", ", waitingFor), waitingFor.size() == 1 ? "is" : "are",
-                    waitUntil, waitingFor.size() == 1 ? "it comes" : "they come"));
+                    seconds(waitUntil), waitingFor.size() == 1 ? "it comes" : "they come"));
         }
         if (replicated + trimmed > 0) {
             log.info("Replication pass: {} copies created, {} surplus copies removed", replicated, trimmed);
@@ -133,8 +135,8 @@ public class ReplicationManager {
         if (targets.isEmpty()) {
             if (reportedNoTarget.add(chunk.id())) {
                 events.chunk(EventType.CHUNK_UNDER_REPLICATED, null, chunk.id(), String.format(
-                        "Chunk %d has %d live cop%s but no other live worker can take another copy; will retry",
-                        chunk.index(), r.sources().size(), r.sources().size() == 1 ? "y" : "ies"));
+                        "%s has %d live cop%s but no other live worker can take another copy; will retry",
+                        capital(chunk.label()), r.sources().size(), r.sources().size() == 1 ? "y" : "ies"));
             }
             return 0;
         }
@@ -150,8 +152,8 @@ public class ReplicationManager {
                 ctx.load().merge(target, 1L, Long::sum);
                 done++;
                 events.chunk(EventType.CHUNK_RE_REPLICATED, target, chunk.id(), String.format(
-                        "Re-replicated chunk %d: copied from %s to %s (live copies %d -> %d; lost copy was on %s)",
-                        chunk.index(), source.get().servedBy(), target, r.sources().size(),
+                        "Re-replicated %s: copied from %s to %s (live copies %d -> %d; lost copy was on %s)",
+                        chunk.label(), source.get().servedBy(), target, r.sources().size(),
                         r.sources().size() + done, describeNotUp(replicas)));
             } catch (Exception e) {
                 log.warn("Re-replication of {} to {} failed: {}", chunk.id(), target, e.getMessage());
@@ -169,8 +171,8 @@ public class ReplicationManager {
             ctx.load().merge(r.workerId(), -1L, Long::sum);
             done++;
             events.chunk(EventType.CHUNK_SURPLUS_REMOVED, r.workerId(), chunk.id(), String.format(
-                    "Chunk %d had %d live copies (> RF %d); removed the newest (temporary) copy on %s",
-                    chunk.index(), liveBefore, props.replicationFactor(), r.workerId()));
+                    "%s had %d live copies (> RF %d); removed the newest (temporary) copy on %s",
+                    capital(chunk.label()), liveBefore, props.replicationFactor(), r.workerId()));
         }
         return done;
     }
@@ -180,6 +182,7 @@ public class ReplicationManager {
      * is simply dropped; otherwise it is rewritten in place from a verified copy.
      */
     public RepairOutcome repairReplica(String chunkId, String workerId, String reason) {
+        if (repairQueue.isSuppressed(chunkId, workerId)) return RepairOutcome.FAILED; // already known: no valid source
         Optional<ChunkRow> chunkOpt = chunks.findChunk(chunkId);
         if (chunkOpt.isEmpty()) return RepairOutcome.NOT_NEEDED;   // object deleted meanwhile
         ChunkRow chunk = chunkOpt.get();
@@ -192,31 +195,43 @@ public class ReplicationManager {
             workerClient.deleteChunk(bad.workerUrl(), chunkId);
             chunks.deleteReplica(chunkId, workerId);
             events.chunk(EventType.CHUNK_REPLICA_DROPPED, workerId, chunkId, String.format(
-                    "Dropped %s copy of chunk %d on %s: %d healthy copies already exist elsewhere",
-                    reason, chunk.index(), workerId, others.size()));
+                    "Dropped %s copy of %s on %s: %d healthy copies already exist elsewhere",
+                    reason, chunk.label(), workerId, others.size()));
+            repairQueue.clearUnrepairable(chunkId, workerId);
             return RepairOutcome.DROPPED;
         }
 
         Optional<ChunkReader.ReadResult> good = reader.readVerified(chunk, others, "repair");
         if (good.isEmpty()) {
+            repairQueue.markUnrepairable(chunkId, workerId);
             events.chunk(EventType.CHUNK_LOST, workerId, chunkId, String.format(
-                    "Cannot repair %s copy of chunk %d on %s: no valid copy is available on any live worker",
-                    reason, chunk.index(), workerId));
+                    "Cannot repair %s copy of %s on %s: no valid copy is available on any live worker "
+                            + "(reads of this chunk fail with 503 instead of returning bad data)",
+                    reason, chunk.label(), workerId));
             return RepairOutcome.FAILED;
         }
         try {
             workerClient.putChunk(bad.workerUrl(), chunkId, good.get().data(), chunk.checksum());
             events.chunk(EventType.CHUNK_REPAIRED, workerId, chunkId, String.format(
-                    "Repaired %s copy of chunk %d on %s by rewriting it from the verified copy on %s",
-                    reason, chunk.index(), workerId, good.get().servedBy()));
+                    "Repaired %s copy of %s on %s by rewriting it from the verified copy on %s",
+                    reason, chunk.label(), workerId, good.get().servedBy()));
+            repairQueue.clearUnrepairable(chunkId, workerId);
             return RepairOutcome.REPAIRED;
         } catch (Exception e) {
             chunks.deleteReplica(chunkId, workerId);
             events.chunk(EventType.CHUNK_REPLICA_DROPPED, workerId, chunkId, String.format(
-                    "Could not rewrite %s copy of chunk %d on %s (%s); removed it so a new copy is placed elsewhere",
-                    reason, chunk.index(), workerId, e.getMessage()));
+                    "Could not rewrite %s copy of %s on %s (%s); removed it so a new copy is placed elsewhere",
+                    reason, chunk.label(), workerId, e.getMessage()));
             return RepairOutcome.DROPPED;
         }
+    }
+
+    private static String capital(String s) {
+        return s.isEmpty() ? s : Character.toUpperCase(s.charAt(0)) + s.substring(1);
+    }
+
+    private static Instant seconds(Instant t) {
+        return t == null ? null : t.truncatedTo(java.time.temporal.ChronoUnit.SECONDS);
     }
 
     private static String describe(List<ReplicaRow> replicas) {

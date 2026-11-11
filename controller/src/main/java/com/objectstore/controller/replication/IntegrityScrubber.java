@@ -38,10 +38,11 @@ public class IntegrityScrubber {
     private final ReplicationManager replication;
     private final EventLog events;
     private final StoreProperties props;
+    private final RepairQueue repairQueue;
 
     public IntegrityScrubber(ChunkDao chunks, ObjectRepository objects, WorkerRepository workers,
                              WorkerClientService workerClient, ReplicationManager replication, EventLog events,
-                             StoreProperties props) {
+                             StoreProperties props, RepairQueue repairQueue) {
         this.chunks = chunks;
         this.objects = objects;
         this.workers = workers;
@@ -49,6 +50,7 @@ public class IntegrityScrubber {
         this.replication = replication;
         this.events = events;
         this.props = props;
+        this.repairQueue = repairQueue;
     }
 
     /** Verifies RECOVERING workers and promotes them to UP. */
@@ -116,6 +118,11 @@ public class IntegrityScrubber {
         for (ExpectedReplica e : expectedList) {
             if (e.objectStatus() != ObjectStatus.AVAILABLE) continue;
             InventoryItem item = actual.get(e.chunkId());
+            boolean bad = item == null || !e.checksum().equalsIgnoreCase(item.checksum());
+            if (bad && repairQueue.isSuppressed(e.chunkId(), w.getId())) {
+                failed++;   // known unrepairable (no valid copy anywhere); already reported
+                continue;
+            }
             String reason;
             if (item == null) {
                 missing++;

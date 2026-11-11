@@ -277,7 +277,7 @@ public class ObjectStoreCli {
                     o.path("contentType").asText(), o.path("chunkCount").asText(), o.path("createdAt").asText()});
         }
         printTable(rows);
-        System.out.printf("page %d of %d, %d object(s) in total%n", body.path("page").asInt(),
+        System.out.printf("page %d of %d, %d object(s) in total%n", body.path("page").asInt() + 1,
                 Math.max(1, body.path("totalPages").asInt()), body.path("totalItems").asLong());
     }
 
