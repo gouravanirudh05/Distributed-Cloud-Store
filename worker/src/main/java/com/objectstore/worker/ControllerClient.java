@@ -1,8 +1,8 @@
 package com.objectstore.worker;
 
-import java.io.IOException;
-import java.nio.file.Files;
-import java.nio.file.Path;
+import java.net.http.HttpClient;
+import java.time.Duration;
+import java.util.LinkedHashMap;
 import java.util.Map;
 
 import org.slf4j.Logger;
@@ -10,11 +10,17 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.context.event.EventListener;
+import org.springframework.http.client.JdkClientHttpRequestFactory;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import org.springframework.web.client.HttpClientErrorException;
 import org.springframework.web.client.RestClient;
 
+/**
+ * Registers this worker with the controller on startup and then sends a heartbeat (with storage stats)
+ * every worker.heartbeat-interval-ms. If the controller answers 404 to a heartbeat it has forgotten us,
+ * so we register again.
+ */
 @Component
 public class ControllerClient {
 
@@ -23,22 +29,28 @@ public class ControllerClient {
     private final RestClient http;
     private final String workerId;
     private final String advertisedUrl;
-    private final Path dataDir;
+    private final ChunkStore store;
     private volatile boolean registered = false;
 
     public ControllerClient(@Value("${worker.controller-url}") String controllerUrl,
                             @Value("${worker.id}") String workerId,
                             @Value("${worker.advertised-url}") String advertisedUrl,
-                            @Value("${worker.data-dir}") String dataDir) {
-        this.http = RestClient.create(controllerUrl);
+                            ChunkStore store) {
+        HttpClient jdk = HttpClient.newBuilder()
+                .version(HttpClient.Version.HTTP_1_1)
+                .connectTimeout(Duration.ofSeconds(2))
+                .build();
+        JdkClientHttpRequestFactory factory = new JdkClientHttpRequestFactory(jdk);
+        factory.setReadTimeout(Duration.ofSeconds(5));
+        this.http = RestClient.builder().baseUrl(controllerUrl).requestFactory(factory).build();
         this.workerId = workerId;
         this.advertisedUrl = advertisedUrl;
-        this.dataDir = Path.of(dataDir);
+        this.store = store;
     }
 
     @EventListener(ApplicationReadyEvent.class)
-    public void onStartup() throws IOException {
-        Files.createDirectories(dataDir);
+    public void onStartup() {
+        log.info("Worker {} storing chunks in {}", workerId, store.getDataDir());
         register();
     }
 
@@ -50,7 +62,7 @@ public class ControllerClient {
         }
         try {
             http.post().uri("/internal/workers/heartbeat")
-                    .body(Map.of("workerId", workerId))
+                    .body(payload())
                     .retrieve().toBodilessEntity();
         } catch (HttpClientErrorException.NotFound e) {
             log.warn("Controller doesn't know us, re-registering");
@@ -63,12 +75,23 @@ public class ControllerClient {
     private void register() {
         try {
             http.post().uri("/internal/workers/register")
-                    .body(Map.of("workerId", workerId, "url", advertisedUrl))
+                    .body(payload())
                     .retrieve().toBodilessEntity();
             registered = true;
-            log.info("Registered with controller as {}", workerId);
+            log.info("Registered with controller as {} ({})", workerId, advertisedUrl);
         } catch (Exception e) {
             log.warn("Register failed (controller not ready?): {}", e.getMessage());
         }
+    }
+
+    private Map<String, Object> payload() {
+        ChunkStore.Stats s = store.stats();
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("workerId", workerId);
+        body.put("url", advertisedUrl);
+        body.put("chunkCount", s.chunkCount());
+        body.put("usedBytes", s.usedBytes());
+        body.put("freeBytes", s.freeBytes());
+        return body;
     }
 }
