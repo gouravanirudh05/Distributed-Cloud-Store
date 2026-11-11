@@ -276,6 +276,7 @@ async function openDetail(id) {
     state.detailMeta = m;
     renderDetail(m);
     $("detail").hidden = false;
+    if (location.hash !== "#object=" + id) history.replaceState(null, "", "#object=" + id);
   } catch (e) {
     toast(e.message, true);
     if (state.detailId === id) closeDetail();
@@ -283,6 +284,7 @@ async function openDetail(id) {
 }
 
 function closeDetail() {
+  if (location.hash.startsWith("#object=")) history.replaceState(null, "", location.pathname);
   $("detail").hidden = true;
   state.detailId = null;
   state.detailMeta = null;
@@ -396,6 +398,7 @@ $("delete-btn").addEventListener("click", async () => {
 
 refreshCluster();
 refreshObjects();
+if (location.hash.startsWith("#object=")) openDetail(decodeURIComponent(location.hash.slice(8)));  // deep link
 setInterval(refreshCluster, 2000);
 setInterval(refreshObjects, 5000);
 setInterval(() => {

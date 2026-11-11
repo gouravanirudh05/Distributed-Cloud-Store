@@ -152,7 +152,7 @@ public class ReplicationManager {
                 ctx.load().merge(target, 1L, Long::sum);
                 done++;
                 events.chunk(EventType.CHUNK_RE_REPLICATED, target, chunk.id(), String.format(
-                        "Re-replicated %s: copied from %s to %s (live copies %d -> %d; lost copy was on %s)",
+                        "Re-replicated %s: copied from %s to %s (live copies %d -> %d%s)",
                         chunk.label(), source.get().servedBy(), target, r.sources().size(),
                         r.sources().size() + done, describeNotUp(replicas)));
             } catch (Exception e) {
@@ -240,7 +240,8 @@ public class ReplicationManager {
     }
 
     private static String describeNotUp(List<ReplicaRow> replicas) {
-        String s = replicas.stream().filter(r -> !r.isUp()).map(ReplicaRow::workerId).collect(Collectors.joining(", "));
-        return s.isEmpty() ? "a removed replica" : s;
+        String s = replicas.stream().filter(r -> !r.isUp()).map(r -> r.workerId() + " (" + r.workerStatus() + ")")
+                .collect(Collectors.joining(", "));
+        return s.isEmpty() ? "; chunk was short of copies (degraded upload or dropped bad copy)" : "; unavailable copy on " + s;
     }
 }
