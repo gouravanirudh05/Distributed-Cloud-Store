@@ -23,5 +23,6 @@
     <modules>
         <module>controller</module>
         <module>worker</module>
+        <module>client</module>
     </modules>
 </project>
