@@ -1,23 +1,41 @@
 server:
   port: ${PORT:8080}
+  tomcat:
+    # let oversized uploads finish so the client receives our JSON error instead of a reset connection
+    max-swallow-size: -1
 
 spring:
   application:
     name: controller
+  threads:
+    virtual:
+      enabled: true
   datasource:
     url: ${DB_URL:jdbc:postgresql://localhost:5432/objectstore}
     username: ${DB_USER:store}
     password: ${DB_PASS:store}
+  sql:
+    init:
+      mode: always            # runs schema.sql (idempotent CREATE TABLE IF NOT EXISTS)
   jpa:
     hibernate:
-      ddl-auto: update
+      ddl-auto: none          # schema is owned by schema.sql
     open-in-view: false
   servlet:
     multipart:
-      max-file-size: 2GB
-      max-request-size: 2GB
+      max-file-size: ${STORE_MAX_OBJECT_SIZE:2GB}
+      max-request-size: ${STORE_MAX_OBJECT_SIZE:2GB}
 
 store:
-  chunk-size: ${STORE_CHUNK_SIZE:1048576}
+  chunk-size: ${STORE_CHUNK_SIZE:1048576}                     # 1 MB
   replication-factor: ${STORE_REPLICATION_FACTOR:2}
-  heartbeat-timeout-ms: ${STORE_HEARTBEAT_TIMEOUT_MS:10000}
+  heartbeat-timeout-ms: ${STORE_HEARTBEAT_TIMEOUT_MS:10000}   # no heartbeat for this long => worker DOWN
+  heartbeat-check-interval-ms: 2000
+  re-replication-grace-ms: ${STORE_RE_REPLICATION_GRACE_MS:30000}  # wait this long after DOWN before copying its chunks elsewhere
+  maintenance-interval-ms: ${STORE_MAINTENANCE_INTERVAL_MS:3000}
+  scrub-interval-ms: ${STORE_SCRUB_INTERVAL_MS:60000}         # background integrity scan of all UP workers
+  worker-connect-timeout-ms: 2000
+  worker-read-timeout-ms: 15000
+  worker-inventory-timeout-ms: 120000
+  stale-operation-timeout-ms: 3600000                         # abandoned UPLOADING/DELETING objects are cleaned up after this
+  event-retention: 2000

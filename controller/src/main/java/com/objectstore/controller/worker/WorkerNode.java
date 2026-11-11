@@ -12,19 +12,22 @@ public class WorkerNode {
     @Enumerated(EnumType.STRING)
     private WorkerStatus status;
     private Instant lastHeartbeat;
+    private Instant downSince;
+    private Instant registeredAt;
+    private Long reportedChunkCount;
+    private Long reportedUsedBytes;
+    private Long reportedFreeBytes;
 
     protected WorkerNode() {}     // JPA needs a no-arg constructor
 
-    public WorkerNode(String id, String url) {
-        this.id = id;
-        this.url = url;
-    }
-
     public String getId() { return id; }
     public String getUrl() { return url; }
-    public void setUrl(String url) { this.url = url; }
     public WorkerStatus getStatus() { return status; }
-    public void setStatus(WorkerStatus status) { this.status = status; }
     public Instant getLastHeartbeat() { return lastHeartbeat; }
-    public void setLastHeartbeat(Instant lastHeartbeat) { this.lastHeartbeat = lastHeartbeat; }
+    public Instant getDownSince() { return downSince; }
+    public Instant getRegisteredAt() { return registeredAt; }
+    public Long getReportedChunkCount() { return reportedChunkCount; }
+    public Long getReportedUsedBytes() { return reportedUsedBytes; }
+    public Long getReportedFreeBytes() { return reportedFreeBytes; }
+    public boolean isUp() { return status == WorkerStatus.UP; }
 }

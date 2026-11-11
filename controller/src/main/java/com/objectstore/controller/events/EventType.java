@@ -1,0 +1,33 @@
+package com.objectstore.controller.events;
+
+/** Cluster events recorded for observability (shown by the admin API, the web UI and the demo). */
+public enum EventType {
+    WORKER_REGISTERED,
+    WORKER_DOWN,
+    WORKER_RECOVERING,
+    WORKER_UP,
+
+    OBJECT_UPLOADED,
+    UPLOAD_DEGRADED,
+    UPLOAD_FAILED,
+    OBJECT_DELETED,
+    METADATA_UPDATED,
+
+    CHUNK_RE_REPLICATED,
+    CHUNK_SURPLUS_REMOVED,
+    CHUNK_UNDER_REPLICATED,
+    CHUNK_UNAVAILABLE,
+    REPLICATION_RESTORED,
+
+    CHUNK_CORRUPTED,
+    CHUNK_MISSING,
+    CHUNK_REPAIRED,
+    CHUNK_REPLICA_DROPPED,
+    CHUNK_LOST,
+    REPLICA_ADOPTED,
+    STALE_COPY_REMOVED,
+    ORPHAN_REMOVED,
+    SCRUB_COMPLETED,
+
+    STALE_OPERATION_CLEANED
+}
