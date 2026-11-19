@@ -140,26 +140,40 @@ public class ReplicationManager {
             }
             return 0;
         }
-        Optional<ChunkReader.ReadResult> source = reader.readVerified(chunk, r.sources(), "re-replication");
-        if (source.isEmpty()) return 0;
-
-        int done = 0;
-        for (String target : targets) {
-            WorkerNode w = ctx.workers().get(target);
-            try {
-                workerClient.putChunk(w.getUrl(), chunk.id(), source.get().data(), chunk.checksum());
-                chunks.insertReplica(chunk.id(), target, Instant.now());
-                ctx.load().merge(target, 1L, Long::sum);
-                done++;
-                events.chunk(EventType.CHUNK_RE_REPLICATED, target, chunk.id(), String.format(
-                        "Re-replicated %s: copied from %s to %s (live copies %d -> %d%s)",
-                        chunk.label(), source.get().servedBy(), target, r.sources().size(),
-                        r.sources().size() + done, describeNotUp(replicas)));
-            } catch (Exception e) {
-                log.warn("Re-replication of {} to {} failed: {}", chunk.id(), target, e.getMessage());
+        // HDFS-style: command a worker that holds a verified copy to push it down a pipeline to the targets
+        List<WorkerClientService.PipelineTarget> pipeline = targets.stream()
+                .map(t -> new WorkerClientService.PipelineTarget(t, ctx.workers().get(t).getUrl())).toList();
+        for (ReplicaRow source : r.sources()) {
+            WorkerClientService.ReplicateResult res =
+                    workerClient.replicate(source.workerUrl(), chunk.id(), chunk.checksum(), pipeline);
+            switch (res.outcome()) {
+                case "MISSING", "CORRUPT" -> {
+                    boolean corrupt = res.outcome().equals("CORRUPT");
+                    events.chunk(corrupt ? EventType.CHUNK_CORRUPTED : EventType.CHUNK_MISSING, source.workerId(),
+                            chunk.id(), String.format("%s copy of %s on %s found during re-replication; "
+                                    + "trying another source; repair scheduled",
+                            corrupt ? "Corrupted" : "Missing", chunk.label(), source.workerId()));
+                    repairQueue.submit(chunk.id(), source.workerId(), corrupt ? "corrupted" : "missing");
+                    continue;
+                }
+                case "OK" -> {
+                    int done = 0;
+                    for (String w : res.storedOn()) {
+                        if (!targets.contains(w)) continue;
+                        chunks.insertReplica(chunk.id(), w, Instant.now());
+                        ctx.load().merge(w, 1L, Long::sum);
+                        done++;
+                        events.chunk(EventType.CHUNK_RE_REPLICATED, w, chunk.id(), String.format(
+                                "Re-replicated %s: pipeline %s -> %s (live copies %d -> %d%s)",
+                                chunk.label(), source.workerId(), String.join(" -> ", res.storedOn()),
+                                r.sources().size(), r.sources().size() + done, describeNotUp(replicas)));
+                    }
+                    if (done > 0) return done;
+                }
+                default -> log.warn("Replicate command for {} to source {} failed", chunk.id(), source.workerId());
             }
         }
-        return done;
+        return 0;
     }
 
     private int trim(ChunkRow chunk, List<ReplicaRow> replicas, List<ReplicaRow> remove, PassContext ctx) {

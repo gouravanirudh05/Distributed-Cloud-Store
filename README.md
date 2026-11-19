@@ -39,7 +39,7 @@ Design decisions and assumptions are listed in [assumptions.md](assumptions.md).
 * **Clients only talk to the controller.** They never learn where chunks live.
 * **Controller** (`controller/`) does the following:
   * splits uploads into chunks and picks the workers for each chunk;
-  * writes both copies in parallel;
+  * writes each chunk through an HDFS-style **pipeline** (controller → first worker → second worker, acknowledged back up the chain);
   * reassembles downloads, verifying every chunk's SHA-256;
   * tracks worker health and keeps every chunk at exactly 2 live copies;
   * runs integrity scans.
@@ -86,7 +86,7 @@ Ports can be changed with `CONTROLLER_PORT=… WEB_PORT=… docker compose up -d
 |---|---------------------------|-----------------------|
 | 1 | Object storage            | Upload a text file with metadata, download it, compare SHA-256 / `cmp`. |
 | 2 | Chunking & distribution   | 5.5 MB upload → 6 chunks (5 × 1 MB + 512 KB), ordered chunk ids, copies on all 4 workers, physical files per worker. |
-| 3 | Replication               | Every chunk has 2 copies on different workers; both on-disk copies of chunk 0 hash to the recorded checksum. |
+| 3 | Replication               | Every chunk has 2 copies on different workers; both on-disk copies of chunk 0 hash to the recorded checksum; worker logs show the pipeline (first worker forwarded to the second). |
 | 4 | Metadata                  | Get metadata; PATCH (update, add, remove a key); checksum and chunk copies unchanged (nothing re-uploaded). |
 | 5 | Worker failure            | `docker stop worker2`: DOWN detected, status DEGRADED, object still downloads correctly. After 30 s, chunks are re-replicated (HEALTHY while worker2 is down). `docker start worker2`: chunks verified, worker UP, temporary copies trimmed, exactly 2 copies per chunk. |
 | 6 | Data integrity            | Corrupt a chunk file with `dd`: the download still returns the original bytes and the bad copy is rewritten. A corrupted secondary copy is found by `POST /admin/scrub`. With both copies corrupted the API answers 503 instead of returning bad data. |
@@ -225,7 +225,8 @@ unchanged, e.g. `{"author":"bob","draft":null}`. Object data is never touched.
 |--------|-------------------------------------------|------------|---------|
 | POST   | `/internal/workers/register`              | controller | `{workerId, url, chunkCount, usedBytes, freeBytes}`, sent on every worker start |
 | POST   | `/internal/workers/heartbeat`             | controller | same body every 3 s; 404 means "register again" |
-| PUT    | `/internal/chunks/{chunkId}`              | worker     | raw bytes plus `X-Expected-Checksum`; worker rejects (400) if the bytes do not hash to it; 201 created / 200 replaced |
+| PUT    | `/internal/chunks/{chunkId}`              | worker     | raw bytes plus `X-Expected-Checksum`; optional `X-Pipeline: workerId=url,...` makes the worker forward the chunk downstream; replies `{storedOn:[...]}`; 400 on checksum mismatch; 201 created / 200 replaced |
+| POST   | `/internal/chunks/{chunkId}/replicate`    | worker     | command: verify the local copy (409 if corrupted, 404 if missing), then push it down the `X-Pipeline` targets |
 | GET    | `/internal/chunks/{chunkId}`              | worker     | raw bytes plus `X-Chunk-Checksum` (SHA-256 of what is on disk now); 404 |
 | DELETE | `/internal/chunks/{chunkId}`              | worker     | 204 (idempotent) |
 | GET    | `/internal/workers/{workerId}/chunks`     | worker     | physical inventory, every chunk re-hashed (`?verify=false` to skip hashing) |
@@ -242,7 +243,7 @@ Worker ports are not published to the host; only the controller (and nginx) can 
 1. The controller assigns a UUID object id and creates the object row in state `UPLOADING`.
 2. It reads the upload 1 MB at a time. Each chunk gets id `<objectId>_<6-digit index>` and a SHA-256.
 3. **Placement**: among UP workers it picks the two holding the fewest chunk copies. Ties rotate, so consecutive chunks spread over all workers.
-4. Both copies are written in parallel. Each worker re-hashes the bytes and refuses a mismatch. If a write fails, the next-best worker is tried.
+4. **HDFS-style pipeline**: the chunk is sent only to the first chosen worker (`PUT /internal/chunks/{id}` with an `X-Pipeline` header naming the rest). That worker stores it, forwards it to the second, and returns the list of workers that stored it (`storedOn`) once the downstream ack arrives. Each worker re-hashes the bytes and refuses a mismatch. If the first worker fails, the next-best becomes the head; if a downstream worker fails it is skipped and the missing copy goes through a new pipeline.
 5. If only one worker is available, the chunk is stored with 1 copy (a *degraded* upload) and the missing copy is added automatically later. If no worker can take a chunk, the upload is rolled back and returns 503.
 6. Chunk and replica rows plus the object's size, SHA-256 and chunk count are committed in one transaction, and the state becomes `AVAILABLE`.
 
@@ -257,7 +258,7 @@ Worker ports are not published to the host; only the controller (and nginx) can 
 |--------------------|--------------|
 | every 3 s          | each worker sends a heartbeat |
 | ~10–12 s after stop| no heartbeat for 10 s → worker **DOWN**; its chunks are under-replicated (status `DEGRADED`), reads use the remaining copy |
-| +30 s grace        | still down → each affected chunk is copied from a verified live copy to another live worker → back to 2 live copies (`HEALTHY`) |
+| +30 s grace        | still down → for each affected chunk the controller commands a worker holding a verified copy to push it down a pipeline to another live worker (data goes worker → worker, not through the controller) → back to 2 live copies (`HEALTHY`) |
 | worker restarts    | it re-registers → **RECOVERING**: the controller re-hashes every chunk on it, then repairs, drops or removes orphans → **UP** |
 | right after        | chunks now have 3 live copies → the newest (temporary) copy is removed → exactly 2 per chunk again |
 

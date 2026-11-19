@@ -8,6 +8,7 @@ import com.objectstore.controller.config.StoreProperties;
 import com.objectstore.controller.events.EventLog;
 import com.objectstore.controller.events.EventType;
 import com.objectstore.controller.worker.WorkerClientService;
+import com.objectstore.controller.worker.WorkerException;
 import com.objectstore.controller.worker.WorkerNode;
 import com.objectstore.controller.worker.WorkerRepository;
 import com.objectstore.controller.worker.WorkerStatus;
@@ -159,7 +160,12 @@ public class ObjectService {
         return getMetadata(id);
     }
 
-    /** Writes one chunk to up to RF workers; on a failed write the next-best worker is tried. */
+    /**
+     * Writes one chunk through an HDFS-style pipeline: the chunk goes to the first chosen worker only, which
+     * stores it and forwards it to the second, and so on; acknowledgements come back up the chain. If the head
+     * of the pipeline fails, the next-best worker becomes the head; if a downstream worker fails, the
+     * missing copy is written through a new pipeline built from workers not yet tried.
+     */
     private List<String> storeReplicas(String chunkId, byte[] data, String checksum, List<WorkerNode> live,
                                        Map<String, Long> load, int rotation) {
         Map<String, String> urls = new HashMap<>();
@@ -168,25 +174,21 @@ public class ObjectService {
 
         int rf = props.replicationFactor();
         List<String> stored = new ArrayList<>();
-        int next = 0;
-        while (stored.size() < rf && next < ranked.size()) {
-            int need = rf - stored.size();
-            List<String> batch = ranked.subList(next, Math.min(ranked.size(), next + need));
-            next += batch.size();
-            List<Future<?>> writes = new ArrayList<>();
-            for (String w : batch) {
-                writes.add(io.submit(() -> workerClient.putChunk(urls.get(w), chunkId, data, checksum)));
-            }
-            for (int i = 0; i < batch.size(); i++) {
-                try {
-                    writes.get(i).get();
-                    stored.add(batch.get(i));
-                } catch (ExecutionException e) {
-                    log.warn("Write of chunk {} to {} failed: {}", chunkId, batch.get(i), e.getCause().getMessage());
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    throw ApiException.internal("Interrupted while storing chunk " + chunkId);
-                }
+        Set<String> tried = new HashSet<>();
+        while (stored.size() < rf) {
+            List<String> candidates = ranked.stream().filter(w -> !tried.contains(w)).toList();
+            if (candidates.isEmpty()) break;
+            List<String> pipe = candidates.subList(0, Math.min(rf - stored.size(), candidates.size()));
+            String head = pipe.get(0);
+            List<WorkerClientService.PipelineTarget> downstream = pipe.subList(1, pipe.size()).stream()
+                    .map(w -> new WorkerClientService.PipelineTarget(w, urls.get(w))).toList();
+            tried.add(head);
+            try {
+                List<String> acks = workerClient.putChunkPipeline(urls.get(head), chunkId, data, checksum, downstream);
+                tried.addAll(pipe);   // every pipeline member was attempted
+                for (String w : acks) if (!stored.contains(w) && urls.containsKey(w)) stored.add(w);
+            } catch (WorkerException e) {
+                log.warn("Pipeline write of chunk {} via {} failed: {}", chunkId, head, e.getMessage());
             }
         }
         stored.forEach(w -> load.merge(w, 1L, Long::sum));

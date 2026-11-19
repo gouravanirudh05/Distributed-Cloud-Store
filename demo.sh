@@ -194,6 +194,12 @@ if want 3; then
     [ "$d" = "$s0" ] || ok=false
   done
   check "both physical copies of chunk 0 are identical to the original chunk" $ok
+  say "HDFS-style write pipeline: the controller sent chunk 0 only to its first worker, which forwarded it to the second"
+  head=$(echo "$m" | jq -r '.chunks[0].replicas[0].workerId'); next=$(echo "$m" | jq -r '.chunks[0].replicas[1].workerId')
+  cmd "docker logs $head | grep $c0 | grep Pipeline"
+  docker logs "$head" 2>&1 | grep "$c0" | grep Pipeline | sed 's/^/    /' | cut -c1-200
+  check "$head forwarded chunk 0 to $next through the pipeline (controller wrote to $head only)" \
+    bash -c "docker logs $head 2>&1 | grep '$c0' | grep -q 'forwarded chunk.* to $next'"
   replication_line
   check "cluster replication status is HEALTHY" is_rep HEALTHY
   pause

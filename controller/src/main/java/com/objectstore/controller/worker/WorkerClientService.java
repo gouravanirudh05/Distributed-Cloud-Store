@@ -46,6 +46,52 @@ public class WorkerClientService {
         return f;
     }
 
+    /** A downstream worker in a write pipeline. */
+    public record PipelineTarget(String workerId, String url) {}
+
+    /** Outcome of a replicate command: OK, MISSING (source lacks the chunk), CORRUPT (source copy bad) or FAILED. */
+    public record ReplicateResult(String outcome, List<String> storedOn) {}
+
+    private static String pipelineHeader(List<PipelineTarget> targets) {
+        return String.join(",", targets.stream().map(t -> t.workerId() + "=" + t.url()).toList());
+    }
+
+    /**
+     * HDFS-style pipeline write: the chunk is sent only to the first worker (workerUrl), which stores it and
+     * forwards it to the downstream targets. Returns ids of all workers that acknowledged storing it.
+     */
+    @SuppressWarnings("unchecked")
+    public List<String> putChunkPipeline(String workerUrl, String chunkId, byte[] data, String sha256,
+                                         List<PipelineTarget> downstream) {
+        try {
+            var req = http.put().uri(workerUrl + "/internal/chunks/{id}", chunkId)
+                    .contentType(MediaType.APPLICATION_OCTET_STREAM)
+                    .header("X-Expected-Checksum", sha256);
+            if (!downstream.isEmpty()) req = req.header("X-Pipeline", pipelineHeader(downstream));
+            java.util.Map<String, Object> body = req.body(data).retrieve().body(java.util.Map.class);
+            return body == null ? List.of() : (List<String>) body.getOrDefault("storedOn", List.of());
+        } catch (RestClientException e) {
+            throw new WorkerException("PUT chunk " + chunkId + " to " + workerUrl + " failed: " + e.getMessage(), e);
+        }
+    }
+
+    /** Tells the worker holding a chunk to verify it and push it down a pipeline to the targets. */
+    @SuppressWarnings("unchecked")
+    public ReplicateResult replicate(String sourceUrl, String chunkId, String sha256, List<PipelineTarget> targets) {
+        try {
+            java.util.Map<String, Object> body = http.post().uri(sourceUrl + "/internal/chunks/{id}/replicate", chunkId)
+                    .header("X-Expected-Checksum", sha256)
+                    .header("X-Pipeline", pipelineHeader(targets))
+                    .retrieve().body(java.util.Map.class);
+            return new ReplicateResult("OK", body == null ? List.of() : (List<String>) body.getOrDefault("storedOn", List.of()));
+        } catch (RestClientResponseException e) {
+            int c = e.getStatusCode().value();
+            return new ReplicateResult(c == 404 ? "MISSING" : c == 409 ? "CORRUPT" : "FAILED", List.of());
+        } catch (RestClientException e) {
+            return new ReplicateResult("FAILED", List.of());
+        }
+    }
+
     /** Stores a chunk; the worker re-hashes the body and rejects it (400) if it does not match sha256. */
     public void putChunk(String workerUrl, String chunkId, byte[] data, String sha256) {
         try {
