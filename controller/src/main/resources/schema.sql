@@ -1,4 +1,7 @@
 -- Metadata schema for the controller. Every statement is idempotent: this runs on each start.
+-- Two controller instances may start at the same time; the advisory lock makes them run this one after the other
+-- (concurrent CREATE TABLE IF NOT EXISTS can fail in PostgreSQL). Spring runs the script on a single connection.
+SELECT pg_advisory_lock(7310001);
 
 CREATE TABLE IF NOT EXISTS workers (
     id                   VARCHAR(64)  PRIMARY KEY,
@@ -69,3 +72,5 @@ CREATE TABLE IF NOT EXISTS events (
     chunk_id  VARCHAR(64),
     message   VARCHAR(2048) NOT NULL
 );
+
+SELECT pg_advisory_unlock(7310001);

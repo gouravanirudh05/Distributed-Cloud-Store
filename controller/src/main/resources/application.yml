@@ -39,3 +39,8 @@ store:
   worker-inventory-timeout-ms: 120000
   stale-operation-timeout-ms: 3600000                         # abandoned UPLOADING/DELETING objects are cleaned up after this
   event-retention: 2000
+
+election:
+  etcd-endpoints: ${ETCD_ENDPOINTS:}                         # comma-separated; empty => standalone (always active)
+  instance-id: ${CONTROLLER_ID:controller}
+  lease-ttl-seconds: ${ELECTION_LEASE_TTL_SECONDS:5}          # a failed active controller is replaced after at most this

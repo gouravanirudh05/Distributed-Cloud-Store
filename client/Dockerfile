@@ -16,7 +16,7 @@ COPY --from=build /build/client/target/client-*.jar /app/client.jar
 RUN printf '#!/bin/sh\nexec java -XX:TieredStopAtLevel=1 -jar /app/client.jar "$@"\n' > /usr/local/bin/objstore \
     && chmod +x /usr/local/bin/objstore
 
-ENV OBJSTORE_URL=http://controller:8080
+ENV OBJSTORE_URL=http://gateway:8080
 WORKDIR /files
 # stays running so you can "docker exec" commands into it
 CMD ["sleep", "infinity"]

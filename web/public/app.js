@@ -76,20 +76,24 @@ const EVENT_CLASS = {
   UPLOAD_FAILED: "bad", WORKER_RECOVERING: "warn", WORKER_REGISTERED: "info", CHUNK_UNDER_REPLICATED: "warn",
   UPLOAD_DEGRADED: "warn", WORKER_UP: "ok", CHUNK_REPAIRED: "ok", CHUNK_RE_REPLICATED: "ok",
   REPLICATION_RESTORED: "ok", OBJECT_UPLOADED: "info", CHUNK_SURPLUS_REMOVED: "info", SCRUB_COMPLETED: "info",
+  CONTROLLER_FAILOVER: "warn", CONTROLLER_ELECTED: "info",
 };
 
 // ---------------------------------------------------------------- cluster
 
 async function refreshCluster() {
   try {
-    const [workers, rep, events] = await Promise.all([
+    const [workers, rep, events, ctl] = await Promise.all([
       api("/admin/workers"), api("/admin/replication?limit=0"), api("/admin/events?limit=60"),
+      api("/admin/controller").catch(() => null),
     ]);
+    $("active-controller").textContent = ctl ? `${ctl.instanceId} (term ${ctl.term})` : "?";
     state.workers = workers;
     renderWorkers(workers);
     renderReplication(rep);
     renderEvents(events);
   } catch (e) {
+    $("active-controller").textContent = "none (failover in progress?)";
     $("cluster-status").replaceWith(Object.assign(pill("CONTROLLER UNREACHABLE"), { id: "cluster-status", className: "pill bad" }));
   }
 }

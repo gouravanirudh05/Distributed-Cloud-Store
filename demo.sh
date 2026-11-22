@@ -10,11 +10,12 @@
 #    6. Data integrity          corrupt stored data on purpose; detection, safe reads, repair
 #    7. Other API operations    list, delete, error responses
 #    8. File formats            images, video, audio, archives, PDF, raw binary: all byte-identical
+#    9. Controller failover     docker kill <active controller>: the standby takes over, no data lost
 #
 #  Usage:  ./demo.sh [--fresh] [--pause] [--only N]
 #     --fresh   wipe all data (docker compose down -v) and rebuild/start the stack first
 #     --pause   wait for <Enter> between sections (for a live presentation)
-#     --only N  run only section N (1-8); objects it depends on are uploaded automatically
+#     --only N  run only section N (1-9); objects it depends on are uploaded automatically
 #  Needs: docker (compose v2), curl, jq, sha256sum.  Exit code = number of failed checks.
 # =============================================================================================
 set -uo pipefail
@@ -92,6 +93,11 @@ corrupt() { # corrupt <worker> <chunkId>: overwrite bytes in the middle of the s
   docker exec "$1" sh -c "printf 'CORRUPTED-ON-PURPOSE' | dd of=/data/chunks/$2 bs=1 seek=4096 conv=notrunc 2>/dev/null"
 }
 disk_sha() { docker exec "$1" sha256sum "/data/chunks/$2" | cut -d' ' -f1; }
+active_controller() { curl -s "$API/admin/controller" | jq -r .instanceId; }
+role_of()  { docker exec "$1" curl -s localhost:8080/internal/controller/leader 2>/dev/null | jq -r .role 2>/dev/null; }
+is_role()  { [ "$(role_of "$1")" = "$2" ]; }
+role_line() { docker exec "$1" curl -s localhost:8080/internal/controller/leader | jq -c '{instanceId, role, activeController, term}' | sed 's/^/    /'; }
+has_active() { [ "$(curl -s -o /dev/null -w '%{http_code}' "$API/admin/controller")" = 200 ]; }
 
 # ------------------------------------------------------------------------------------ preflight
 for tool in docker curl jq sha256sum; do
@@ -110,6 +116,8 @@ if ! curl -s -o /dev/null "$API/objects"; then
   echo "The controller is not reachable at $API. Start the stack with: docker compose up -d --build"
   exit 2
 fi
+wait_for 90 "an active controller (elected via etcd)" has_active || exit 2
+say "active controller: $(curl -s "$API/admin/controller" | jq -r '"\(.instanceId) (term \(.term))"')"
 wait_for 120 "all 4 workers UP" all_up || exit 2
 workers_line
 replication_line
@@ -431,6 +439,52 @@ if want 8; then
   fi
   for id in "${FMT_IDS[@]}"; do curl -s -o /dev/null -X DELETE "$API/objects/$id"; done
   rm -f "$FILES/.fmt.out" "$FILES/.fmt.zip" "$FILES/.fmt.mp4"
+  pause
+fi
+
+# ------------------------------------------------------------------------------------ 9
+if want 9; then
+  section "9. Controller failover: docker kill <active controller>"
+  say "two controller instances run; etcd elects one ACTIVE, the other is a hot STANDBY. The gateway (port 8082)"
+  say "routes to the active one. Metadata is in PostgreSQL, shared by both, so the standby can take over at any time."
+  ensure_large
+  ACTIVE=$(active_controller)
+  [ "$ACTIVE" = controller1 ] && STANDBY=controller2 || STANDBY=controller1
+  for c in controller1 controller2; do cmd "docker exec $c curl -s localhost:8080/internal/controller/leader"; role_line "$c"; done
+  check "exactly one controller is ACTIVE ($ACTIVE) and the other is STANDBY" \
+    [ "$(role_of "$ACTIVE")" = ACTIVE -a "$(role_of "$STANDBY")" = STANDBY ]
+  code=$(docker exec "$STANDBY" curl -s -o /dev/null -w '%{http_code}' localhost:8080/api/v1/objects)
+  check "the standby refuses client requests itself (503), so only one controller ever acts" [ "$code" = 503 ]
+
+  say "a client keeps calling the API every 200 ms while the active controller is killed (SIGKILL, no clean shutdown)"
+  ( end=$((SECONDS + 20)); while [ $SECONDS -lt $end ]; do
+      printf '%s %s\n' "$(date +%s.%N | cut -c1-14)" "$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "$API/objects?size=1")"
+      sleep 0.2; done ) > "$FILES/.probe" &
+  PROBE=$!
+  sleep 2
+  T_KILL=$(date +%s.%N)
+  cmd "docker kill $ACTIVE"
+  docker kill "$ACTIVE" >/dev/null
+  wait_for 30 "$STANDBY to take over" is_role "$STANDBY" ACTIVE
+  wait "$PROBE"
+  gap=$(awk -v t="$T_KILL" '$1 >= t && $2 != 200 { if (!f) f = $1; l = $1 } END { if (f) printf "%.1f", l - f + 0.2; else print 0 }' "$FILES/.probe")
+  say "requests during the run: $(awk '{print $2}' "$FILES/.probe" | sort | uniq -c | awk '{printf "%s x HTTP %s  ", $1, $2}')"
+  say "the API was unavailable for about ${gap} s (lease TTL is 5 s)"
+  check "$STANDBY is now the ACTIVE controller" is_role "$STANDBY" ACTIVE
+  check "the API answered again within 15 s of the kill" awk -v g="$gap" 'BEGIN { exit !(g < 15) }'
+  curl -s -o "$FILES/.failover.bin" "$API/objects/$LARGE_ID"
+  check "an object stored before the failover still downloads byte-identical" cmp -s "$FILES/large-5.5MB.bin" "$FILES/.failover.bin"
+  out=$(upload "$FILES/hello.txt"); code=$(echo "$out" | tail -n1); D=$(echo "$out" | head -n -1 | jq -r .objectId)
+  check "new uploads work on the new active controller (201)" [ "$code" = 201 ]
+  curl -s -o /dev/null -X DELETE "$API/objects/$D"
+  check "no worker was marked DOWN because of the failover" all_up
+  recent_events 8 'CONTROLLER'
+
+  cmd "docker start $ACTIVE"
+  docker start "$ACTIVE" >/dev/null
+  wait_for 90 "$ACTIVE to rejoin" is_role "$ACTIVE" STANDBY
+  check "$ACTIVE came back as the STANDBY (it does not take leadership back)" is_role "$ACTIVE" STANDBY
+  rm -f "$FILES/.probe" "$FILES/.failover.bin"
   pause
 fi
 

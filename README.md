@@ -1,11 +1,12 @@
 # Mini Distributed Cloud Object Store
 
 A distributed object store that splits objects into 1 MB chunks, keeps two copies of every chunk on
-different storage workers, survives worker failures, and detects and repairs corrupted data.
+different storage workers, survives worker failures and controller failures, and detects and repairs
+corrupted data.
 
 | Spec parameter      | This system                                                        |
 |---------------------|--------------------------------------------------------------------|
-| Controller nodes    | 1 (`controller`, Spring Boot) + its PostgreSQL metadata store       |
+| Controller nodes    | 1 active controller (`controller1` or `controller2`, Spring Boot) + a hot standby, elected through etcd; shared PostgreSQL metadata store |
 | Storage workers     | 4 (`worker1` … `worker4`), each with its own persistent Docker volume |
 | Clients             | 2: CLI container (`client`) and browser UI (`web`)                  |
 | Chunk size          | 1 MB (1,048,576 bytes); the last chunk may be smaller               |
@@ -19,19 +20,21 @@ Design decisions and assumptions are listed in [assumptions.md](assumptions.md).
 ## 1. Architecture
 
 ```
-            ┌───────────────┐      ┌──────────────────────┐
-  browser ─▶│ web (nginx)   │─────▶│                      │      ┌────────────┐
-            │ :3000         │ /api │   controller :8080   │◀────▶│ PostgreSQL │ metadata: objects,
-            └───────────────┘      │   (host port 8082)   │      └────────────┘ chunks, replica
-            ┌───────────────┐      │                      │                     locations, workers,
-  you ─────▶│ client (CLI)  │─────▶│ public  /api/v1/...  │                     events
-            └───────────────┘      │ internal /internal/..│
-                                   └──────────┬───────────┘
-                     PUT/GET/DELETE chunks    │   ▲ register + heartbeat (every 3 s)
-              ┌───────────────┬───────────────┼───┴───────────┬───────────────┐
-              ▼               ▼               ▼               ▼               │
-         ┌─────────┐     ┌─────────┐     ┌─────────┐     ┌─────────┐          │
-         │ worker1 │     │ worker2 │     │ worker3 │     │ worker4 │──────────┘
+            ┌───────────────┐       ┌──────────────────┐     ┌──────────────────┐  ┌────────────┐
+  browser ─▶│ web (nginx)   │──────▶│ gateway (HAProxy)│────▶│ controller1      │─▶│ PostgreSQL │ metadata (shared)
+            │ :3000         │ /api  │ host port 8082   │     │  ACTIVE          │  └────────────┘
+            └───────────────┘       │ routes to the    │     ├──────────────────┤        ▲
+            ┌───────────────┐       │ ACTIVE controller│ ┄┄▶ │ controller2      │────────┘
+  you ─────▶│ client (CLI)  │──────▶│ only             │     │  STANDBY         │
+            └───────────────┘       └────────▲─────────┘     └────────┬─────────┘
+                                             │                        │ leader election (lease)
+                                             │                 ┌──────▼──────────────┐
+                    register + heartbeat     │                 │ etcd1  etcd2  etcd3 │
+                    (every 3 s, via gateway) │                 └─────────────────────┘
+              ┌───────────────┬──────────────┴┬───────────────┐
+              │ PUT/GET/DELETE chunks (from the active controller)
+         ┌────▼────┐     ┌────▼────┐     ┌────▼────┐     ┌────▼────┐
+         │ worker1 │     │ worker2 │     │ worker3 │     │ worker4 │
          │ volume  │     │ volume  │     │ volume  │     │ volume  │  /data/chunks/<chunkId>
          └─────────┘     └─────────┘     └─────────┘     └─────────┘
 ```
@@ -44,8 +47,14 @@ Design decisions and assumptions are listed in [assumptions.md](assumptions.md).
   * tracks worker health and keeps every chunk at exactly 2 live copies;
   * runs integrity scans.
 * **Workers** (`worker/`) store chunks as files on a Docker volume. They register on start and send a heartbeat (with disk stats) every 3 s. They expose the internal chunk API.
-* **PostgreSQL** holds all metadata, so the controller can restart without losing anything.
-* **web** (`web/`) is a static dashboard served by nginx, which proxies `/api` to the controller.
+* **PostgreSQL** holds all metadata, so a controller can restart, or be replaced by the standby, without losing anything.
+* **Controller failover**: two controller instances run. They elect one **active** controller through a
+  3-node **etcd** cluster (a lease that the active controller renews every second). The other is a hot
+  **standby**: it refuses requests and does no background work. If the active controller dies, its lease
+  expires and the standby takes over within about 5 s. See [Controller failover](#controller-failover).
+* **gateway** (`gateway/`, HAProxy) is the one stable controller address for clients, the web UI and the
+  workers. It health-checks both controllers and routes only to the active one.
+* **web** (`web/`) is a static dashboard served by nginx, which proxies `/api` to the gateway.
 * **client** (`client/`) is a Java CLI (`objstore`) in its own container, with `./files` mounted at `/files`.
 
 ---
@@ -56,16 +65,17 @@ Prerequisites: Docker with Compose v2. The demo script also needs `curl`, `jq` a
 You do **not** need Java or Maven on the host: images are built with multi-stage Dockerfiles.
 
 ```bash
-docker compose up -d --build        # build images and start postgres, controller, 4 workers, client, web
-docker compose ps                   # controller "healthy", workers "healthy"
+docker compose up -d --build        # build images and start postgres, etcd x3, 2 controllers, gateway, 4 workers, client, web
+docker compose ps                   # controllers, gateway and workers "healthy"
 ```
 
 | What               | URL / command                                  |
 |--------------------|------------------------------------------------|
 | Web UI             | http://localhost:3000                          |
-| REST API           | http://localhost:8082/api/v1/objects           |
+| REST API           | http://localhost:8082/api/v1/objects (gateway → active controller) |
 | CLI                | `docker exec -it client objstore help`         |
-| Logs               | `docker compose logs -f controller worker2`    |
+| Logs               | `docker compose logs -f controller1 controller2 worker2` |
+| Active controller  | `curl localhost:8082/api/v1/admin/controller`  |
 | Stop (keep data)   | `docker compose down`                          |
 | Reset all data     | `docker compose down -v`                       |
 
@@ -76,7 +86,7 @@ Ports can be changed with `CONTROLLER_PORT=… WEB_PORT=… docker compose up -d
 ## 3. Running the required demonstrations
 
 ```bash
-./demo.sh            # runs all demonstrations with narration and PASS/FAIL checks (~2 minutes)
+./demo.sh            # runs all demonstrations with narration and PASS/FAIL checks (~2.5 minutes)
 ./demo.sh --fresh    # wipe data, rebuild, then run everything
 ./demo.sh --pause    # stop between sections (live presentation)
 ./demo.sh --only 5   # a single section, e.g. 5 = worker failure
@@ -92,6 +102,7 @@ Ports can be changed with `CONTROLLER_PORT=… WEB_PORT=… docker compose up -d
 | 6 | Data integrity            | Corrupt a chunk file with `dd`: the download still returns the original bytes and the bad copy is rewritten. A corrupted secondary copy is found by `POST /admin/scrub`. With both copies corrupted the API answers 503 instead of returning bad data. |
 | 7 | Other API operations      | List, delete (204 then 404), 400 errors. |
 | 8 | File formats              | Images, video, audio, ZIP/7z/tar.gz/xz, PDF, text, ELF binary, empty file, Unicode name: each uploaded, downloaded, compared byte for byte (samples are generated if missing; needs ffmpeg/zip for some). |
+| 9 | Controller failover       | `docker kill` the active controller while a client polls the API: the standby takes over (~5 s gap), stored objects still download byte-identical, uploads work, no worker is marked DOWN. The killed controller restarts as the standby. |
 
 ### Doing it by hand
 
@@ -117,6 +128,15 @@ curl -X POST http://localhost:8082/api/v1/admin/scrub      # or simply download 
 ```
 
 (If `worker1` does not hold that chunk, pick a worker from `.chunks[0].replicas[].workerId`.)
+
+```bash
+# controller failover
+curl -s http://localhost:8082/api/v1/admin/controller | jq '{instanceId, role, term}'   # e.g. controller1 ACTIVE
+docker kill controller1                       # hard crash (docker stop = clean shutdown, takeover in ~1 s)
+sleep 7; curl -s http://localhost:8082/api/v1/admin/controller | jq '{instanceId, role, term}'   # controller2 ACTIVE
+curl -o out.pdf http://localhost:8082/api/v1/objects/$ID && cmp out.pdf files/report.pdf          # nothing lost
+docker start controller1                      # comes back as STANDBY
+```
 
 ---
 
@@ -219,6 +239,7 @@ unchanged, e.g. `{"author":"bob","draft":null}`. Object data is never touched.
 | GET    | `/admin/replication`                  | Cluster replication health and every chunk not at RF, with copy locations. |
 | POST   | `/admin/scrub`                        | Run an integrity scan of all UP workers now; returns a report. |
 | GET    | `/admin/events?limit=50&type=…`       | Cluster event log (failures, re-replication, corruption, repairs…). |
+| GET    | `/admin/controller`                   | The active controller: instance id, election term, active since, election backend. |
 
 ### Internal worker API (spec §6)
 
@@ -233,8 +254,10 @@ unchanged, e.g. `{"author":"bob","draft":null}`. Object data is never touched.
 | GET    | `/internal/workers/{workerId}/chunks`     | worker     | physical inventory, every chunk re-hashed (`?verify=false` to skip hashing) |
 | GET    | `/internal/workers/{workerId}/chunks`     | controller | the chunks the metadata assigns to that worker |
 | GET    | `/internal/workers`                       | controller | worker registry |
+| GET    | `/internal/controller/leader`             | controller | 200 if this instance is the active controller, 503 if standby (the gateway's health check) |
 
-Worker ports are not published to the host; only the controller (and nginx) can reach them.
+Worker and controller ports are not published to the host; only the gateway (port 8082) and the web UI (port 3000) are.
+A standby controller answers every `/api` and `/internal` request with 503 `NOT_ACTIVE_CONTROLLER`.
 
 ---
 
@@ -265,6 +288,24 @@ Worker ports are not published to the host; only the controller (and nginx) can 
 
 The grace period stops a short restart from triggering a full copy. All repair work runs on one maintenance thread (every 3 s), so steps never race each other.
 
+### Controller failover
+* **Election.** Each controller instance campaigns in etcd for the key `objectstore/controller/leader`. The
+  winner writes it with an atomic "create only if absent" transaction, bound to a **5 s lease**, and renews the
+  lease every second. The etcd revision of that write is the controller's **term** (shown in the UI and events).
+* **Standby.** The other instance watches the key every second. It refuses requests (503) and runs no
+  background work: no failure detection, repair, re-replication or scrubs.
+* **Failover.** If the active controller dies or loses contact with etcd, it stops renewing. etcd deletes the key
+  when the lease expires, the standby creates it and becomes active, and the gateway (health check every
+  500 ms) switches traffic to it. After a hard crash this takes about 5 s. A clean `docker stop` releases the
+  lease at once, so the takeover takes about 1 s.
+* **No two active controllers.** A controller treats itself as active only while its last renewal is less than
+  3 s old (0.6 × TTL), while a standby can only win once the full 5 s lease has expired. So the old controller has
+  always stopped acting before a new one starts, even if it is still running but cut off from etcd.
+* **Nothing is lost.** All state is in PostgreSQL, which both instances share. On taking over, the new active
+  controller removes objects the old one left mid-upload or mid-delete (those requests failed), and waits a full
+  heartbeat timeout before it marks any worker DOWN, so heartbeats lost during the switch don't count.
+* **etcd** runs as 3 nodes, so election keeps working while any one etcd node is down.
+
 ### Data integrity
 * SHA-256 is recorded for every chunk and for the whole object at upload.
 * Integrity is checked in three places:
@@ -290,7 +331,10 @@ The grace period stops a short restart from triggering a full copy. All repair w
 | `RE_REPLICATION_GRACE_MS`                    | 30000     | wait after DOWN before re-replicating |
 | `SCRUB_INTERVAL_MS`                          | 60000     | background integrity scan period |
 | `STORE_MAX_OBJECT_SIZE`                      | 2GB       | max upload size |
-| `WORKER_ID`, `WORKER_URL`, `CONTROLLER_URL`, `DATA_DIR`, `WORKER_HEARTBEAT_INTERVAL_MS` | per worker | worker identity, address, storage dir, heartbeat period (3000) |
+| `CONTROLLER_ID`                              | controller1/2 | controller instance name used in the election |
+| `ETCD_ENDPOINTS`                             | etcd1-3   | etcd cluster for leader election; empty = standalone controller (always active) |
+| `ELECTION_LEASE_TTL_SECONDS`                 | 5         | a crashed active controller is replaced after about this long |
+| `WORKER_ID`, `WORKER_URL`, `CONTROLLER_URL`, `DATA_DIR`, `WORKER_HEARTBEAT_INTERVAL_MS` | per worker | worker identity, address, storage dir, controller address (the gateway), heartbeat period (3000) |
 
 ---
 
@@ -304,6 +348,7 @@ mvn -q package -DskipTests    # build jars locally (Java 21)
 ```
 controller/   Spring Boot controller
   api/          REST controllers (objects, admin), DTOs, JSON error handling
+  cluster/      leader election through etcd, standby request guard, controller status
   object/       upload/download/metadata/delete, chunk DAO, placement, verified chunk reader
   replication/  maintenance loop, replication planner/manager, integrity scrubber
   worker/       worker registry, heartbeats, health monitor, HTTP client to workers
@@ -311,11 +356,13 @@ controller/   Spring Boot controller
 worker/       Spring Boot worker (ChunkStore + internal chunk API + heartbeats)
 client/       Java CLI (objstore)
 web/          nginx + static dashboard
+gateway/      HAProxy config: routes to the active controller
 demo.sh       scripted demonstrations
 ```
 
 ### Troubleshooting
 * **Port already in use**: set `CONTROLLER_PORT` / `WEB_PORT`.
+* **API answers 503 `NO_ACTIVE_CONTROLLER`**: no controller is active (failover in progress, or both stopped). Check `docker compose ps controller1 controller2 etcd1 etcd2 etcd3`.
 * **`demo.sh` says a worker is not UP**: check `docker compose ps` and `docker compose logs worker2`.
 * **Start from a clean slate**: `docker compose down -v && docker compose up -d --build`.
 * **Build hangs at "load metadata for docker.io/…" with a gpg/credential error**: your Docker credential helper is locked. Unlock it (e.g. `docker login`), or build with an empty config: `DOCKER_CONFIG=$(mktemp -d) docker compose build`. With an empty config you may need to copy `~/.docker/cli-plugins` into that directory.

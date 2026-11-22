@@ -1,0 +1,7 @@
+HTTP/1.0 503 Service Unavailable
+Cache-Control: no-cache
+Connection: close
+Content-Type: application/json
+Retry-After: 2
+
+{"status":503,"error":"Service Unavailable","code":"NO_ACTIVE_CONTROLLER","message":"No controller is active at the moment (a failover is in progress or all controllers are down). Retry shortly."}
