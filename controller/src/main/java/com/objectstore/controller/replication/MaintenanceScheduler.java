@@ -125,7 +125,11 @@ public class MaintenanceScheduler {
         try {
             tick();
         } catch (Throwable t) {
-            log.error("Maintenance tick failed", t);
+            if (com.objectstore.controller.cluster.MetadataStoreStatus.isConnectionFailure(t)) {
+                log.debug("Maintenance tick skipped: metadata store unreachable");
+            } else {
+                log.error("Maintenance tick failed", t);
+            }
         }
     }
 

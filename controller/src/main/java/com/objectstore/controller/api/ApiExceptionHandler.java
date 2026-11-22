@@ -1,6 +1,7 @@
 package com.objectstore.controller.api;
 
 import com.objectstore.controller.api.ApiModels.ErrorResponse;
+import com.objectstore.controller.cluster.MetadataStoreStatus;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import org.slf4j.Logger;
@@ -28,6 +29,12 @@ import java.time.Instant;
 public class ApiExceptionHandler {
 
     private static final Logger log = LoggerFactory.getLogger(ApiExceptionHandler.class);
+
+    private final MetadataStoreStatus metadataStore;
+
+    public ApiExceptionHandler(MetadataStoreStatus metadataStore) {
+        this.metadataStore = metadataStore;
+    }
 
     @ExceptionHandler(ApiException.class)
     public ResponseEntity<ErrorResponse> api(ApiException e, HttpServletRequest req, HttpServletResponse res) {
@@ -85,6 +92,14 @@ public class ApiExceptionHandler {
 
     @ExceptionHandler(Exception.class)
     public ResponseEntity<ErrorResponse> unexpected(Exception e, HttpServletRequest req, HttpServletResponse res) {
+        if (MetadataStoreStatus.isConnectionFailure(e)) {
+            metadataStore.failure(Instant.now());
+            log.warn("{} {} failed: metadata store unreachable", req.getMethod(), req.getRequestURI());
+            res.setHeader("Retry-After", "5");
+            return build(HttpStatus.SERVICE_UNAVAILABLE, "METADATA_STORE_UNAVAILABLE",
+                    "The metadata store is temporarily unavailable (database down or failing over). No data is lost; retry shortly.",
+                    req, res);
+        }
         log.error("Unhandled error on {} {}", req.getMethod(), req.getRequestURI(), e);
         return build(HttpStatus.INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", "Internal server error: " + e.getMessage(), req, res);
     }

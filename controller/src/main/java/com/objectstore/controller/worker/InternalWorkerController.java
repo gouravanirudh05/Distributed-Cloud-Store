@@ -3,6 +3,7 @@ package com.objectstore.controller.worker;
 import com.objectstore.controller.api.ApiException;
 import com.objectstore.controller.api.ApiModels.ExpectedChunk;
 import com.objectstore.controller.api.ApiModels.WorkerChunksView;
+import com.objectstore.controller.cluster.ClusterIdentity;
 import com.objectstore.controller.events.EventLog;
 import com.objectstore.controller.events.EventType;
 import com.objectstore.controller.object.ChunkDao;
@@ -15,6 +16,8 @@ import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Pattern;
 
 /**
@@ -31,25 +34,33 @@ public class InternalWorkerController {
 
     private static final Pattern WORKER_ID = Pattern.compile("[A-Za-z0-9._-]{1,64}");
 
-    public record RegisterRequest(String workerId, String url, Long chunkCount, Long usedBytes, Long freeBytes) {}
-    public record HeartbeatRequest(String workerId, String url, Long chunkCount, Long usedBytes, Long freeBytes) {}
+    public record RegisterRequest(String workerId, String url, Long chunkCount, Long usedBytes, Long freeBytes,
+                                  String clusterId) {}
+    public record HeartbeatRequest(String workerId, String url, Long chunkCount, Long usedBytes, Long freeBytes,
+                                   String clusterId) {}
 
     private final WorkerRepository workers;
     private final ChunkDao chunks;
     private final EventLog events;
     private final MaintenanceScheduler maintenance;
+    private final ClusterIdentity cluster;
+    /** worker|clusterId pairs already reported as rejected (the worker retries every few seconds). */
+    private final Set<String> rejectionsReported = ConcurrentHashMap.newKeySet();
 
     public InternalWorkerController(WorkerRepository workers, ChunkDao chunks, EventLog events,
-                                    MaintenanceScheduler maintenance) {
+                                    MaintenanceScheduler maintenance, ClusterIdentity cluster) {
         this.workers = workers;
         this.chunks = chunks;
         this.events = events;
         this.maintenance = maintenance;
+        this.cluster = cluster;
     }
 
     @PostMapping("/register")
-    public Map<String, Object> register(@RequestBody RegisterRequest req) {
+    public ResponseEntity<Map<String, Object>> register(@RequestBody RegisterRequest req) {
         validate(req.workerId(), req.url());
+        ResponseEntity<Map<String, Object>> foreign = rejectForeign(req.workerId(), req.clusterId(), orZero(req.chunkCount()));
+        if (foreign != null) return foreign;
         Optional<WorkerNode> before = workers.findById(req.workerId());
         workers.upsertRegistration(req.workerId(), req.url(), Instant.now(),
                 orZero(req.chunkCount()), orZero(req.usedBytes()), orMinusOne(req.freeBytes()));
@@ -59,7 +70,26 @@ public class InternalWorkerController {
                 : String.format("Worker %s (re)started and registered (was %s, %d chunks on disk); verifying its chunks before marking UP",
                 req.workerId(), before.get().getStatus(), orZero(req.chunkCount())));
         maintenance.triggerSoon();
-        return Map.of("registered", true, "workerId", req.workerId(), "status", WorkerStatus.RECOVERING.name());
+        return ResponseEntity.ok(Map.of("registered", true, "workerId", req.workerId(),
+                "status", WorkerStatus.RECOVERING.name(), "clusterId", cluster.clusterId()));
+    }
+
+    /**
+     * A worker that already belongs to a different cluster (its stored cluster id differs from this metadata's)
+     * is refused: this metadata does not describe its chunks, so treating them as orphans would delete data.
+     * A worker without a cluster id (new, or from before cluster ids existed) is accepted and adopts ours.
+     */
+    private ResponseEntity<Map<String, Object>> rejectForeign(String workerId, String workerCluster, long chunkCount) {
+        String ours = cluster.clusterId();
+        if (workerCluster == null || workerCluster.isBlank() || workerCluster.equals(ours)) return null;
+        if (rejectionsReported.add(workerId + "|" + workerCluster)) {
+            events.worker(EventType.WORKER_REJECTED, workerId, String.format(
+                    "Worker %s refused: its %d stored chunks belong to cluster %s, but this metadata is cluster %s "
+                            + "(empty, re-created or wrong database?). Its data is left untouched.",
+                    workerId, chunkCount, workerCluster, ours));
+        }
+        return ResponseEntity.status(409).body(Map.of("error", "CLUSTER_ID_MISMATCH",
+                "workerClusterId", workerCluster, "controllerClusterId", ours));
     }
 
     @PostMapping("/heartbeat")
@@ -67,6 +97,8 @@ public class InternalWorkerController {
         if (req.workerId() == null || req.workerId().isBlank()) {
             throw ApiException.badRequest("'workerId' is required");
         }
+        ResponseEntity<Map<String, Object>> foreign = rejectForeign(req.workerId(), req.clusterId(), orZero(req.chunkCount()));
+        if (foreign != null) return foreign;
         Optional<WorkerNode> before = workers.findById(req.workerId());
         if (before.isEmpty()) {
             // unknown worker -> it must register again
@@ -81,7 +113,7 @@ public class InternalWorkerController {
                             : before.get().getDownSince().truncatedTo(java.time.temporal.ChronoUnit.SECONDS)));
             maintenance.triggerSoon();
         }
-        return ResponseEntity.ok(Map.of("ok", true));
+        return ResponseEntity.ok(Map.of("ok", true, "clusterId", cluster.clusterId()));
     }
 
     @GetMapping

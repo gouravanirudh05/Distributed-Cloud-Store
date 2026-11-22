@@ -73,4 +73,14 @@ CREATE TABLE IF NOT EXISTS events (
     message   VARCHAR(2048) NOT NULL
 );
 
+-- Identity of this storage cluster, created once. Workers remember it on disk and refuse to join a controller
+-- whose metadata has a different identity (e.g. an empty, re-created or wrong database), so such a controller
+-- can never treat their chunks as orphans and delete them. (Like the clusterID in an HDFS DataNode's VERSION file.)
+CREATE TABLE IF NOT EXISTS cluster_info (
+    id         INTEGER     PRIMARY KEY CHECK (id = 1),
+    cluster_id VARCHAR(36) NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL
+);
+INSERT INTO cluster_info (id, cluster_id, created_at) VALUES (1, gen_random_uuid()::text, now()) ON CONFLICT (id) DO NOTHING;
+
 SELECT pg_advisory_unlock(7310001);

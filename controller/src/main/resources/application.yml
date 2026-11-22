@@ -14,6 +14,11 @@ spring:
     url: ${DB_URL:jdbc:postgresql://localhost:5432/objectstore}
     username: ${DB_USER:store}
     password: ${DB_PASS:store}
+    hikari:
+      connection-timeout: 3000   # fail fast (503) instead of hanging 30 s when PostgreSQL is down
+      validation-timeout: 1000
+      keepalive-time: 30000
+      max-lifetime: 600000
   sql:
     init:
       mode: always            # runs schema.sql (idempotent CREATE TABLE IF NOT EXISTS)

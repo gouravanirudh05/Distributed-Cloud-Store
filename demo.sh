@@ -11,11 +11,12 @@
 #    7. Other API operations    list, delete, error responses
 #    8. File formats            images, video, audio, archives, PDF, raw binary: all byte-identical
 #    9. Controller failover     docker kill <active controller>: the standby takes over, no data lost
+#   10. Metadata store failover docker kill <PostgreSQL primary>: the replica is promoted, no metadata lost
 #
 #  Usage:  ./demo.sh [--fresh] [--pause] [--only N]
 #     --fresh   wipe all data (docker compose down -v) and rebuild/start the stack first
 #     --pause   wait for <Enter> between sections (for a live presentation)
-#     --only N  run only section N (1-9); objects it depends on are uploaded automatically
+#     --only N  run only section N (1-10); objects it depends on are uploaded automatically
 #  Needs: docker (compose v2), curl, jq, sha256sum.  Exit code = number of failed checks.
 # =============================================================================================
 set -uo pipefail
@@ -97,6 +98,14 @@ active_controller() { curl -s "$API/admin/controller" | jq -r .instanceId; }
 role_of()  { docker exec "$1" curl -s localhost:8080/internal/controller/leader 2>/dev/null | jq -r .role 2>/dev/null; }
 is_role()  { [ "$(role_of "$1")" = "$2" ]; }
 role_line() { docker exec "$1" curl -s localhost:8080/internal/controller/leader | jq -c '{instanceId, role, activeController, term}' | sed 's/^/    /'; }
+pg_role()   { docker exec "$1" curl -s localhost:8008/patroni 2>/dev/null | jq -r '"\(.role) \(.replication_state // .state)"' 2>/dev/null; }
+pg_primary() { for n in postgres1 postgres2; do [ "$(docker exec "$n" curl -s -o /dev/null -w '%{http_code}' localhost:8008/primary 2>/dev/null)" = 200 ] && echo "$n"; done; }
+is_pg_primary()   { [ "$(pg_primary)" = "$1" ]; }
+is_pg_streaming() { [ "$(docker exec "$1" curl -s -o /dev/null -w '%{http_code}' localhost:8008/replica 2>/dev/null)" = 200 ] \
+                    && docker exec "$1" curl -s localhost:8008/patroni | jq -e '.replication_state == "streaming"' >/dev/null; }
+patroni_table() { docker exec "$(pg_primary | head -n1)" patronictl -c /etc/patroni/patroni.yml list 2>/dev/null | grep -E 'Member|postgres[12]' | sed 's/^/    /'; }
+event_count() { curl -s "$API/admin/events?limit=500&type=$1" | jq 'length'; }
+more_events() { [ "$(event_count "$1")" -gt "$2" ]; }   # more_events <type> <count-before>
 has_active() { [ "$(curl -s -o /dev/null -w '%{http_code}' "$API/admin/controller")" = 200 ]; }
 
 # ------------------------------------------------------------------------------------ preflight
@@ -485,6 +494,66 @@ if want 9; then
   wait_for 90 "$ACTIVE to rejoin" is_role "$ACTIVE" STANDBY
   check "$ACTIVE came back as the STANDBY (it does not take leadership back)" is_role "$ACTIVE" STANDBY
   rm -f "$FILES/.probe" "$FILES/.failover.bin"
+  pause
+fi
+
+# ------------------------------------------------------------------------------------ 10
+if want 10; then
+  section "10. Metadata store failover: docker kill <PostgreSQL primary>"
+  say "metadata lives in PostgreSQL: a primary plus a synchronous streaming replica, managed by Patroni (primary"
+  say "elected through etcd). Controllers connect via pg-proxy, which always points at the current primary."
+  ensure_large
+  cmd "docker exec postgres1 patronictl list"
+  patroni_table
+  PRIMARY=$(pg_primary)
+  [ "$PRIMARY" = postgres1 ] && REPLICA=postgres2 || REPLICA=postgres1
+  check "one PostgreSQL node is the primary ($PRIMARY), the other a streaming replica" \
+    [ -n "$PRIMARY" ] && is_pg_streaming "$REPLICA"
+
+  say "a client keeps calling the API every 250 ms while the primary is killed (SIGKILL)"
+  ( end=$((SECONDS + 45)); while [ $SECONDS -lt $end ]; do
+      printf '%s %s %s\n' "$(date +%s.%N | cut -c1-14)" $(curl -s -o /dev/null -w '%{http_code} %{time_total}' --max-time 10 "$API/objects?size=1")
+      sleep 0.25; done ) > "$FILES/.pgprobe" &
+  PROBE=$!
+  sleep 2
+  EV0=$(event_count METADATA_STORE_RECOVERED)
+  T_KILL=$(date +%s.%N)
+  cmd "docker kill $PRIMARY"
+  docker kill "$PRIMARY" >/dev/null
+  wait_for 60 "Patroni to promote $REPLICA" is_pg_primary "$REPLICA"
+  wait "$PROBE"
+  gap=$(awk -v t="$T_KILL" '$1 >= t && $2 != 200 { if (!f) f = $1; l = $1 } END { if (f) printf "%.1f", l - f + 0.25; else print 0 }' "$FILES/.pgprobe")
+  codes=$(awk '$2 != 200 {print $2}' "$FILES/.pgprobe" | sort -u | tr '\n' ' ')
+  slowest=$(awk '$2 != 200 {print $3}' "$FILES/.pgprobe" | sort -n | tail -n1)
+  say "requests during the run: $(awk '{print $2}' "$FILES/.pgprobe" | sort | uniq -c | awk '{printf "%s x HTTP %s  ", $1, $2}')"
+  say "the API was unavailable for about ${gap} s; failed requests answered in at most ${slowest:-0} s"
+  check "$REPLICA was promoted to primary" is_pg_primary "$REPLICA"
+  check "meanwhile the API answered 503 (not 500), quickly (<= 5 s), instead of hanging" \
+    [ "${codes:-503 }" = "503 " ] && awk -v s="${slowest:-0}" 'BEGIN { exit !(s <= 5) }'
+  check "the API answered again within 60 s of the kill" awk -v g="$gap" 'BEGIN { exit !(g < 60) }'
+  curl -s -o "$FILES/.pgfailover.bin" "$API/objects/$LARGE_ID"
+  check "an object stored before the failover downloads byte-identical (no metadata lost)" \
+    cmp -s "$FILES/large-5.5MB.bin" "$FILES/.pgfailover.bin"
+  out=$(upload "$FILES/hello.txt"); code=$(echo "$out" | tail -n1); D=$(echo "$out" | head -n -1 | jq -r .objectId)
+  check "new uploads are stored in the new primary (201)" [ "$code" = 201 ]
+  curl -s -o /dev/null -X DELETE "$API/objects/$D"
+  wait_for 20 "the controller to log the recovery" more_events METADATA_STORE_RECOVERED "$EV0"
+  check "the controller noticed the outage and logged the recovery (METADATA_STORE_RECOVERED)" \
+    more_events METADATA_STORE_RECOVERED "$EV0"
+  check "no worker was marked DOWN because of the database outage" all_up
+  recent_events 6 'METADATA_STORE'
+
+  cmd "docker start $PRIMARY"
+  docker start "$PRIMARY" >/dev/null
+  wait_for 90 "$PRIMARY to rejoin as a replica" is_pg_streaming "$PRIMARY"
+  check "$PRIMARY rejoined as a streaming replica of the new primary" is_pg_streaming "$PRIMARY"
+  patroni_table
+
+  say "metadata backups (pg_dump every 10 min into the pg-backups volume; restore: scripts/restore-metadata.sh)"
+  cmd "docker exec pg-backup pg-backup.sh once"
+  out=$(docker exec pg-backup pg-backup.sh once); echo "    $out"
+  check "a metadata backup can be taken from the current primary" grep -q "backup OK" <<<"$out"
+  rm -f "$FILES/.pgprobe" "$FILES/.pgfailover.bin"
   pause
 fi
 

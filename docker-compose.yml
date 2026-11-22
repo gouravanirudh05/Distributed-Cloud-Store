@@ -1,5 +1,6 @@
 # Mini Distributed Cloud Object Store: 1 active controller (+1 hot standby, elected via etcd), 4 workers,
 # 2 clients (CLI + web UI). Clients and workers reach the active controller through the gateway.
+# Metadata: PostgreSQL primary + synchronous replica (Patroni), reached through pg-proxy; periodic backups.
 # Start:  docker compose up -d --build
 # Web UI: http://localhost:3000     REST API (gateway): http://localhost:8082/api/v1/objects
 name: distributed-cloud-store
@@ -18,8 +19,40 @@ x-etcd: &etcd
   networks:
     - objectstore-net
 
+x-pg-env: &pg-env
+  PATRONI_SCOPE: objectstore-metadata
+  PATRONI_SUPERUSER_USERNAME: postgres
+  PATRONI_SUPERUSER_PASSWORD: postgres-admin
+  PATRONI_REPLICATION_USERNAME: replicator
+  PATRONI_REPLICATION_PASSWORD: replicator
+  PATRONI_REWIND_USERNAME: postgres
+  PATRONI_REWIND_PASSWORD: postgres-admin
+  APP_DB_USER: store
+  APP_DB_PASSWORD: store
+  APP_DB_NAME: objectstore
+
+x-pg-node: &pg-node
+  build:
+    context: ./postgres
+  image: objectstore-postgres:latest
+  depends_on:
+    etcd1:
+      condition: service_healthy
+    etcd2:
+      condition: service_healthy
+    etcd3:
+      condition: service_healthy
+  healthcheck:
+    test: ["CMD", "curl", "-fs", "http://localhost:8008/health"]
+    interval: 3s
+    timeout: 3s
+    retries: 60
+    start_period: 20s
+  networks:
+    - objectstore-net
+
 x-controller-env: &controller-env
-  DB_URL: jdbc:postgresql://postgres:5432/objectstore
+  DB_URL: jdbc:postgresql://pg-proxy:5432/objectstore?connectTimeout=3&tcpKeepAlive=true
   DB_USER: store
   DB_PASS: store
   ETCD_ENDPOINTS: http://etcd1:2379,http://etcd2:2379,http://etcd3:2379
@@ -36,7 +69,7 @@ x-controller: &controller
     dockerfile: controller/Dockerfile
   image: objectstore-controller:latest
   depends_on:
-    postgres:
+    pg-proxy:
       condition: service_healthy
     etcd1:
       condition: service_healthy
@@ -71,23 +104,71 @@ x-worker: &worker
     - objectstore-net
 
 services:
-  # Metadata store used by the controller (objects, chunks, replica locations, workers, events)
-  postgres:
-    image: postgres:15-alpine
-    container_name: postgres
+  # Metadata store: PostgreSQL in high availability. Two nodes run under Patroni, which elects the primary
+  # through etcd and keeps the other node a synchronous streaming replica; if the primary fails, the replica
+  # is promoted. Controllers always connect through pg-proxy, which routes to the current primary.
+  postgres1:
+    <<: *pg-node
+    container_name: postgres1
     environment:
-      POSTGRES_DB: objectstore
-      POSTGRES_USER: store
-      POSTGRES_PASSWORD: store
+      <<: *pg-env
+      PATRONI_NAME: postgres1
+      PATRONI_RESTAPI_CONNECT_ADDRESS: postgres1:8008
+      PATRONI_POSTGRESQL_CONNECT_ADDRESS: postgres1:5432
+    volumes:
+      - pg1-data:/var/lib/postgresql/data
+  postgres2:
+    <<: *pg-node
+    container_name: postgres2
+    environment:
+      <<: *pg-env
+      PATRONI_NAME: postgres2
+      PATRONI_RESTAPI_CONNECT_ADDRESS: postgres2:8008
+      PATRONI_POSTGRESQL_CONNECT_ADDRESS: postgres2:5432
+    volumes:
+      - pg2-data:/var/lib/postgresql/data
+
+  # The one database address for the controllers (pg-proxy:5432; host port 5433 for inspection):
+  # always the current primary.
+  pg-proxy:
+    build:
+      context: ./pg-proxy
+    image: objectstore-pg-proxy:latest
+    container_name: pg-proxy
     ports:
       - "5433:5432"
-    volumes:
-      - postgres-data:/var/lib/postgresql/data
+    depends_on:
+      - postgres1
+      - postgres2
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U store -d objectstore"]
+      # healthy while a primary is available
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8404/ready"]
       interval: 3s
-      timeout: 5s
-      retries: 10
+      timeout: 3s
+      retries: 60
+      start_period: 10s
+    networks:
+      - objectstore-net
+
+  # Periodic metadata backups (pg_dump) into the pg-backups volume. Restore: scripts/restore-metadata.sh
+  pg-backup:
+    build:
+      context: ./pg-backup
+    image: objectstore-pg-backup:latest
+    container_name: pg-backup
+    environment:
+      PGHOST: pg-proxy
+      PGPORT: 5432
+      PGUSER: store
+      PGPASSWORD: store
+      PGDATABASE: objectstore
+      BACKUP_INTERVAL_SECONDS: ${BACKUP_INTERVAL_SECONDS:-600}
+      BACKUP_KEEP: ${BACKUP_KEEP:-24}
+    volumes:
+      - pg-backups:/backups
+    depends_on:
+      pg-proxy:
+        condition: service_healthy
     networks:
       - objectstore-net
 
@@ -228,7 +309,9 @@ services:
       - objectstore-net
 
 volumes:
-  postgres-data:
+  pg1-data:
+  pg2-data:
+  pg-backups:
   etcd1-data:
   etcd2-data:
   etcd3-data:

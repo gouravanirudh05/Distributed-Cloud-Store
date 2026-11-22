@@ -1,12 +1,13 @@
 # Mini Distributed Cloud Object Store
 
 A distributed object store that splits objects into 1 MB chunks, keeps two copies of every chunk on
-different storage workers, survives worker failures and controller failures, and detects and repairs
-corrupted data.
+different storage workers, survives worker, controller and metadata-database failures, and detects and
+repairs corrupted data.
 
 | Spec parameter      | This system                                                        |
 |---------------------|--------------------------------------------------------------------|
-| Controller nodes    | 1 active controller (`controller1` or `controller2`, Spring Boot) + a hot standby, elected through etcd; shared PostgreSQL metadata store |
+| Controller nodes    | 1 active controller (`controller1` or `controller2`, Spring Boot) + a hot standby, elected through etcd |
+| Metadata store      | PostgreSQL primary + synchronous replica (`postgres1`/`postgres2`, Patroni), reached via `pg-proxy`; periodic backups (`pg-backup`) |
 | Storage workers     | 4 (`worker1` … `worker4`), each with its own persistent Docker volume |
 | Clients             | 2: CLI container (`client`) and browser UI (`web`)                  |
 | Chunk size          | 1 MB (1,048,576 bytes); the last chunk may be smaller               |
@@ -20,17 +21,17 @@ Design decisions and assumptions are listed in [assumptions.md](assumptions.md).
 ## 1. Architecture
 
 ```
-            ┌───────────────┐       ┌──────────────────┐     ┌──────────────────┐  ┌────────────┐
-  browser ─▶│ web (nginx)   │──────▶│ gateway (HAProxy)│────▶│ controller1      │─▶│ PostgreSQL │ metadata (shared)
-            │ :3000         │ /api  │ host port 8082   │     │  ACTIVE          │  └────────────┘
-            └───────────────┘       │ routes to the    │     ├──────────────────┤        ▲
-            ┌───────────────┐       │ ACTIVE controller│ ┄┄▶ │ controller2      │────────┘
-  you ─────▶│ client (CLI)  │──────▶│ only             │     │  STANDBY         │
-            └───────────────┘       └────────▲─────────┘     └────────┬─────────┘
-                                             │                        │ leader election (lease)
-                                             │                 ┌──────▼──────────────┐
-                    register + heartbeat     │                 │ etcd1  etcd2  etcd3 │
-                    (every 3 s, via gateway) │                 └─────────────────────┘
+            ┌───────────────┐       ┌──────────────────┐     ┌──────────────────┐   ┌──────────┐   ┌───────────────────┐
+  browser ─▶│ web (nginx)   │──────▶│ gateway (HAProxy)│────▶│ controller1      │──▶│ pg-proxy │──▶│ postgres1 PRIMARY │
+            │ :3000         │ /api  │ host port 8082   │     │  ACTIVE          │   │ (HAProxy)│   │      │ sync       │
+            └───────────────┘       │ routes to the    │     ├──────────────────┤   └──────────┘   │      ▼ replication│
+            ┌───────────────┐       │ ACTIVE controller│ ┄┄▶ │ controller2      │        ▲         │ postgres2 REPLICA │
+  you ─────▶│ client (CLI)  │──────▶│ only             │     │  STANDBY         │   pg-backup      └─────────┬─────────┘
+            └───────────────┘       └────────▲─────────┘     └────────┬─────────┘   (pg_dump)                │ Patroni
+                                             │                        │ controller election                │ primary election
+                                             │                 ┌──────▼────────────────────────────────────▼──┐
+                    register + heartbeat     │                 │            etcd1    etcd2    etcd3           │
+                    (every 3 s, via gateway) │                 └──────────────────────────────────────────────┘
               ┌───────────────┬──────────────┴┬───────────────┐
               │ PUT/GET/DELETE chunks (from the active controller)
          ┌────▼────┐     ┌────▼────┐     ┌────▼────┐     ┌────▼────┐
@@ -48,6 +49,10 @@ Design decisions and assumptions are listed in [assumptions.md](assumptions.md).
   * runs integrity scans.
 * **Workers** (`worker/`) store chunks as files on a Docker volume. They register on start and send a heartbeat (with disk stats) every 3 s. They expose the internal chunk API.
 * **PostgreSQL** holds all metadata, so a controller can restart, or be replaced by the standby, without losing anything.
+  It runs as two nodes under **Patroni**: a primary and a synchronous streaming replica. Patroni elects the
+  primary through the same etcd cluster and promotes the replica if the primary fails. The controllers connect
+  through **pg-proxy** (HAProxy), which always points at the current primary. See [Metadata store](#metadata-store).
+* **pg-backup** takes a `pg_dump` of the metadata every 10 minutes into its own volume; `scripts/restore-metadata.sh` restores one.
 * **Controller failover**: two controller instances run. They elect one **active** controller through a
   3-node **etcd** cluster (a lease that the active controller renews every second). The other is a hot
   **standby**: it refuses requests and does no background work. If the active controller dies, its lease
@@ -65,7 +70,7 @@ Prerequisites: Docker with Compose v2. The demo script also needs `curl`, `jq` a
 You do **not** need Java or Maven on the host: images are built with multi-stage Dockerfiles.
 
 ```bash
-docker compose up -d --build        # build images and start postgres, etcd x3, 2 controllers, gateway, 4 workers, client, web
+docker compose up -d --build        # etcd x3, postgres1/2 + pg-proxy + pg-backup, 2 controllers, gateway, 4 workers, client, web
 docker compose ps                   # controllers, gateway and workers "healthy"
 ```
 
@@ -86,7 +91,7 @@ Ports can be changed with `CONTROLLER_PORT=… WEB_PORT=… docker compose up -d
 ## 3. Running the required demonstrations
 
 ```bash
-./demo.sh            # runs all demonstrations with narration and PASS/FAIL checks (~2.5 minutes)
+./demo.sh            # runs all demonstrations with narration and PASS/FAIL checks (~3.5 minutes)
 ./demo.sh --fresh    # wipe data, rebuild, then run everything
 ./demo.sh --pause    # stop between sections (live presentation)
 ./demo.sh --only 5   # a single section, e.g. 5 = worker failure
@@ -103,6 +108,7 @@ Ports can be changed with `CONTROLLER_PORT=… WEB_PORT=… docker compose up -d
 | 7 | Other API operations      | List, delete (204 then 404), 400 errors. |
 | 8 | File formats              | Images, video, audio, ZIP/7z/tar.gz/xz, PDF, text, ELF binary, empty file, Unicode name: each uploaded, downloaded, compared byte for byte (samples are generated if missing; needs ffmpeg/zip for some). |
 | 9 | Controller failover       | `docker kill` the active controller while a client polls the API: the standby takes over (~5 s gap), stored objects still download byte-identical, uploads work, no worker is marked DOWN. The killed controller restarts as the standby. |
+| 10 | Metadata store failover  | `docker kill` the PostgreSQL primary while a client polls the API: the replica is promoted (~17 s gap, requests get a fast 503 meanwhile), stored objects still download byte-identical, uploads work, no worker is marked DOWN, the killed node rejoins as a replica; a metadata backup is taken. |
 
 ### Doing it by hand
 
@@ -136,6 +142,17 @@ docker kill controller1                       # hard crash (docker stop = clean 
 sleep 7; curl -s http://localhost:8082/api/v1/admin/controller | jq '{instanceId, role, term}'   # controller2 ACTIVE
 curl -o out.pdf http://localhost:8082/api/v1/objects/$ID && cmp out.pdf files/report.pdf          # nothing lost
 docker start controller1                      # comes back as STANDBY
+
+# metadata store failover
+docker exec postgres1 patronictl -c /etc/patroni/patroni.yml list   # who is Leader / Sync Standby
+docker kill postgres1                         # if postgres1 is the Leader; ~20 s later postgres2 is
+curl -s http://localhost:8082/api/v1/objects  # 503 METADATA_STORE_UNAVAILABLE during the switch, then 200
+docker start postgres1                        # rejoins as a replica
+
+# metadata backups
+docker exec pg-backup pg-backup.sh once       # take a backup now (also runs every 10 min)
+scripts/restore-metadata.sh                   # list backups
+scripts/restore-metadata.sh latest            # restore the newest (asks for confirmation)
 ```
 
 ---
@@ -245,8 +262,8 @@ unchanged, e.g. `{"author":"bob","draft":null}`. Object data is never touched.
 
 | Method | Endpoint                                  | Hosted by  | Purpose |
 |--------|-------------------------------------------|------------|---------|
-| POST   | `/internal/workers/register`              | controller | `{workerId, url, chunkCount, usedBytes, freeBytes}`, sent on every worker start |
-| POST   | `/internal/workers/heartbeat`             | controller | same body every 3 s; 404 means "register again" |
+| POST   | `/internal/workers/register`              | controller | `{workerId, url, chunkCount, usedBytes, freeBytes, clusterId}`, sent on every worker start; replies with the cluster id; **409** if the worker belongs to a different cluster |
+| POST   | `/internal/workers/heartbeat`             | controller | same body every 3 s; 404 means "register again"; 409 as above |
 | PUT    | `/internal/chunks/{chunkId}`              | worker     | raw bytes plus `X-Expected-Checksum`; optional `X-Pipeline: workerId=url,...` makes the worker forward the chunk downstream; replies `{storedOn:[...]}`; 400 on checksum mismatch; 201 created / 200 replaced |
 | POST   | `/internal/chunks/{chunkId}/replicate`    | worker     | command: verify the local copy (409 if corrupted, 404 if missing), then push it down the `X-Pipeline` targets |
 | GET    | `/internal/chunks/{chunkId}`              | worker     | raw bytes plus `X-Chunk-Checksum` (SHA-256 of what is on disk now); 404 |
@@ -306,6 +323,29 @@ The grace period stops a short restart from triggering a full copy. All repair w
   heartbeat timeout before it marks any worker DOWN, so heartbeats lost during the switch don't count.
 * **etcd** runs as 3 nodes, so election keeps working while any one etcd node is down.
 
+### Metadata store
+* **High availability.** Two PostgreSQL nodes run under Patroni. Patroni holds the primary's leader key in etcd
+  (20 s TTL); if the primary dies, the replica is promoted and pg-proxy (health check every second against
+  Patroni's `/primary` endpoint) switches the controllers' connections to it. A returning node rejoins as a
+  replica (using `pg_rewind` if needed). Measured: about 17-20 s of unavailability after a hard kill.
+* **No committed metadata is lost.** Replication is synchronous while both nodes are up: a commit is only
+  acknowledged once the replica has it. With only one node left, the primary continues alone.
+* **Fail fast.** While no primary is reachable, API calls answer **503 `METADATA_STORE_UNAVAILABLE`** within
+  3 s (database connection timeout) instead of hanging, and recover on their own.
+* **No false worker failures.** Heartbeats cannot be recorded while the database is down, so after it returns
+  the controller waits a full heartbeat timeout (10 s) before marking any worker DOWN, and logs a
+  `METADATA_STORE_RECOVERED` event.
+* **Backups.** `pg-backup` runs `pg_dump` (custom format) against the current primary every
+  `BACKUP_INTERVAL_SECONDS` (600) and keeps the newest `BACKUP_KEEP` (24) in the `pg-backups` volume.
+  `scripts/restore-metadata.sh latest` stops the controllers, restores, and starts them again. The restored
+  metadata is as old as the backup: objects uploaded after it are gone (their chunks are removed as orphans),
+  objects deleted after it reappear but cannot be read (503, `CHUNK_LOST`).
+* **Cluster identity guard.** The metadata has a cluster id (`cluster_info`), created once. Each worker stores
+  the id of the cluster it joined in `/data/chunks/.cluster-id` and sends it with every heartbeat. A controller
+  whose metadata has a different id (an empty, re-created or wrong database) **refuses** the worker (409,
+  `WORKER_REJECTED` event) instead of treating all its chunks as orphans and deleting them. This is the same
+  idea as the cluster ID in an HDFS DataNode's `VERSION` file.
+
 ### Data integrity
 * SHA-256 is recorded for every chunk and for the whole object at upload.
 * Integrity is checked in three places:
@@ -334,6 +374,8 @@ The grace period stops a short restart from triggering a full copy. All repair w
 | `CONTROLLER_ID`                              | controller1/2 | controller instance name used in the election |
 | `ETCD_ENDPOINTS`                             | etcd1-3   | etcd cluster for leader election; empty = standalone controller (always active) |
 | `ELECTION_LEASE_TTL_SECONDS`                 | 5         | a crashed active controller is replaced after about this long |
+| `DB_URL`                                     | pg-proxy  | metadata database (through pg-proxy, i.e. the current primary) |
+| `BACKUP_INTERVAL_SECONDS`, `BACKUP_KEEP`      | 600, 24   | metadata backup period and how many backups to keep |
 | `WORKER_ID`, `WORKER_URL`, `CONTROLLER_URL`, `DATA_DIR`, `WORKER_HEARTBEAT_INTERVAL_MS` | per worker | worker identity, address, storage dir, controller address (the gateway), heartbeat period (3000) |
 
 ---
@@ -357,11 +399,17 @@ worker/       Spring Boot worker (ChunkStore + internal chunk API + heartbeats)
 client/       Java CLI (objstore)
 web/          nginx + static dashboard
 gateway/      HAProxy config: routes to the active controller
+postgres/     PostgreSQL + Patroni image (primary election through etcd, streaming replication)
+pg-proxy/     HAProxy config: routes database connections to the current primary
+pg-backup/    periodic pg_dump backups
+scripts/      restore-metadata.sh
 demo.sh       scripted demonstrations
 ```
 
 ### Troubleshooting
 * **Port already in use**: set `CONTROLLER_PORT` / `WEB_PORT`.
+* **API answers 503 `METADATA_STORE_UNAVAILABLE`**: no PostgreSQL primary is reachable (failover in progress or both nodes down). Check `docker exec postgres1 patronictl -c /etc/patroni/patroni.yml list`.
+* **A worker logs "Controller REFUSED this worker"** (`WORKER_REJECTED` event): its chunks belong to a different cluster than the controller's metadata, e.g. the database was wiped while the worker volumes were kept. Restore the right database (backup), or wipe the worker volumes to start over (`docker compose down -v`).
 * **API answers 503 `NO_ACTIVE_CONTROLLER`**: no controller is active (failover in progress, or both stopped). Check `docker compose ps controller1 controller2 etcd1 etcd2 etcd3`.
 * **`demo.sh` says a worker is not UP**: check `docker compose ps` and `docker compose logs worker2`.
 * **Start from a clean slate**: `docker compose down -v && docker compose up -d --build`.
