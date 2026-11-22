@@ -391,7 +391,8 @@ if want 8; then
       archive.tar.gz)      tar czf "$f" -C "$FILES" notes.txt ;;
       archive.7z)          command -v 7z >/dev/null && 7z a -bso0 "$f" "$FILES/notes.txt" ;;
       notes.txt.xz)        command -v xz >/dev/null && xz -k -c "$FILES/notes.txt" > "$f" ;;
-      spec.pdf)            cp Mini_Distributed_Cloud_Object_Store.pdf "$f" ;;
+      spec.pdf)            cp Mini_Distributed_Cloud_Object_Store.pdf "$f" 2>/dev/null \
+                             || printf '%%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 200]>>endobj\ntrailer<</Root 1 0 R>>\n%%%%EOF\n' > "$f" ;;
       random.bin)          head -c 5255225 /dev/urandom > "$f" ;;
       exact_2MiB.bin)      head -c 2097152 /dev/urandom > "$f" ;;
       empty.dat)           : > "$f" ;;
@@ -412,6 +413,7 @@ if want 8; then
     "ls-elf-binary|application/octet-stream" "empty.dat|application/octet-stream"
     "résumé final (v2) 日本.bin|application/octet-stream"
   )
+  [ -f "$FILES/notes.txt" ] || gen_file notes.txt      # the archive samples are built from it
   printf '    %-30s %10s  %-32s %6s  %s\n' FILE BYTES CONTENT-TYPE CHUNKS RESULT
   FMT_IDS=()
   for entry in "${FORMATS[@]}"; do

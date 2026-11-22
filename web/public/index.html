@@ -5,31 +5,52 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Object Store Console</title>
   <link rel="stylesheet" href="style.css">
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect x='1' y='2' width='14' height='4' rx='1' fill='%232563eb'/%3E%3Crect x='1' y='7' width='14' height='4' rx='1' fill='%233b82f6'/%3E%3Crect x='1' y='12' width='14' height='3' rx='1' fill='%2393c5fd'/%3E%3C/svg%3E">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect x='1' y='2' width='14' height='4' rx='1' fill='%234f46e5'/%3E%3Crect x='1' y='7' width='14' height='4' rx='1' fill='%236366f1'/%3E%3Crect x='1' y='12' width='14' height='3' rx='1' fill='%23a5b4fc'/%3E%3C/svg%3E">
 </head>
 <body>
 <header class="topbar">
-  <div class="brand">
-    <span class="logo" aria-hidden="true"></span>
-    <div>
-      <h1>Object Store Console</h1>
-      <p class="sub">active controller <span id="active-controller">…</span> (+ standby) · 4 workers · 1 MB chunks · replication factor <span id="rf">2</span></p>
+  <div class="topbar-inner">
+    <div class="brand">
+      <span class="logo" aria-hidden="true"><i></i><i></i><i></i></span>
+      <div>
+        <h1>Distributed Object Store</h1>
+        <p class="sub">1 MB chunks · replication factor <span id="rf">2</span> · 4 storage workers · active/standby controllers</p>
+      </div>
     </div>
-  </div>
-  <div class="health">
-    <span class="label">Cluster</span>
-    <span id="cluster-status" class="pill neutral">loading…</span>
+    <div class="health">
+      <div class="chip"><span class="chip-label">Active controller</span><span id="active-controller" class="chip-value">…</span></div>
+      <div class="chip"><span class="chip-label">Cluster</span><span id="cluster-status" class="pill neutral">loading…</span></div>
+    </div>
   </div>
 </header>
 
 <main>
+  <section class="stats" aria-label="Summary">
+    <div class="stat"><span class="stat-label">Objects</span><span class="stat-value" id="stat-objects">–</span><span class="stat-sub">fully stored</span></div>
+    <div class="stat"><span class="stat-label">Chunks</span><span class="stat-value" id="stat-chunks">–</span><span class="stat-sub" id="stat-copies">–</span></div>
+    <div class="stat"><span class="stat-label">Workers up</span><span class="stat-value" id="stat-workers">–</span><span class="stat-sub" id="stat-workers-sub">heartbeat every 3 s</span></div>
+    <div class="stat"><span class="stat-label">Replication</span><span class="stat-value small" id="stat-replication">–</span><span class="stat-sub" id="replication-line"></span></div>
+  </section>
+
+  <section class="card" aria-labelledby="infra-h">
+    <div class="section-head">
+      <h2 id="infra-h">Infrastructure</h2>
+      <span class="hint">who is active right now · refreshes every 2 s</span>
+    </div>
+    <div class="infra" id="infra">
+      <div class="infra-group"><h3>Control plane</h3><div class="nodes" id="infra-control"></div></div>
+      <div class="infra-group"><h3>Metadata store (PostgreSQL + Patroni)</h3><div class="nodes" id="infra-db"></div></div>
+      <div class="infra-group"><h3>Coordination (etcd)</h3><div class="nodes" id="infra-etcd"></div></div>
+    </div>
+    <p class="hint" id="infra-note" hidden>Infrastructure details come from the demo-runner container, which is not reachable.</p>
+  </section>
+
   <section aria-labelledby="workers-h">
     <div class="section-head">
-      <h2 id="workers-h">Workers</h2>
-      <span class="hint">live heartbeat view · refreshes every 2 s</span>
+      <h2 id="workers-h">Storage workers</h2>
+      <span class="hint">live heartbeat view</span>
     </div>
     <div id="workers" class="workers"></div>
-    <p id="replication-line" class="replication-line"></p>
   </section>
 
   <div class="grid">
@@ -39,6 +60,7 @@
         <form id="upload-form">
           <label class="drop" id="drop">
             <input type="file" id="file" name="file" required>
+            <span class="drop-icon" aria-hidden="true">⇪</span>
             <span id="drop-text">Choose a file or drop it here</span>
           </label>
           <div class="meta-editor" id="upload-meta"></div>
@@ -57,14 +79,14 @@
         </div>
         <div class="table-wrap">
           <table class="objects">
-            <thead><tr><th>Name</th><th>Size</th><th>Type</th><th class="num">Chunks</th><th>Created</th></tr></thead>
+            <thead><tr><th>Name</th><th class="num">Size</th><th>Type</th><th class="num">Chunks</th><th>Created</th></tr></thead>
             <tbody id="objects-body"></tbody>
           </table>
         </div>
         <div class="pager">
-          <button class="ghost" id="prev">‹ Prev</button>
+          <button class="ghost small" id="prev">‹ Prev</button>
           <span id="page-label"></span>
-          <button class="ghost" id="next">Next ›</button>
+          <button class="ghost small" id="next">Next ›</button>
         </div>
       </section>
     </div>
@@ -88,6 +110,25 @@
       </section>
     </div>
   </div>
+
+  <section class="card scenarios-card" id="scenarios" aria-labelledby="scenarios-h">
+    <div class="section-head">
+      <div>
+        <h2 id="scenarios-h">Demo scenarios</h2>
+        <p class="hint">Run each demonstration one at a time and watch the panels above react. Each runs <code>demo.sh --only N</code> with PASS/FAIL checks.</p>
+      </div>
+      <span id="runner-status" class="pill neutral">…</span>
+    </div>
+    <div class="scenario-grid" id="scenario-list"></div>
+
+    <div class="console" id="console" hidden>
+      <div class="console-head">
+        <div class="console-title"><span class="dot" id="console-dot"></span><span id="console-title">Scenario</span></div>
+        <div class="console-meta"><span id="console-meta"></span><button class="ghost small" id="console-close">Close</button></div>
+      </div>
+      <pre id="console-body" class="console-body" aria-live="polite"></pre>
+    </div>
+  </section>
 </main>
 
 <aside id="detail" class="detail" hidden aria-labelledby="detail-name">

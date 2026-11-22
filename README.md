@@ -59,6 +59,7 @@ repairs corrupted data.
   workers. It health-checks both controllers and routes only to the active one.
 * **web** (`web/`) is a static dashboard served by nginx, which proxies `/api` to the gateway.
 * **client** (`client/`) is a Java CLI (`objstore`) in its own container, with `./files` mounted at `/files`.
+* **demo-runner** (`demo-runner/`) runs the demo scenarios when the web UI's buttons are pressed and reports which controller, PostgreSQL node and etcd node is up/active.
 
 ---
 
@@ -68,7 +69,7 @@ repairs corrupted data.
 
 | Needed | Notes |
 |--------|-------|
-| Docker Engine with **Compose v2** (`docker compose version`) | Linux, macOS or Windows (WSL2). About 4 GB of free RAM: the stack runs 16 containers. |
+| Docker Engine with **Compose v2** (`docker compose version`) | Linux, macOS or Windows (WSL2). About 4 GB of free RAM: the stack runs 17 containers. |
 | Free host ports **8082** (API), **3000** (web UI), **5433** (PostgreSQL, for inspection) | Ports 8082 and 3000 can be changed, see below. |
 | `curl`, `jq`, `sha256sum` on the host | Used by `demo.sh` and the commands in this guide. |
 | Optional: `ffmpeg`, `zip`, `7z`, `xz`, `unzip`, `ffprobe` | Only for demo section 8 (file formats); missing tools just skip those samples. |
@@ -96,8 +97,8 @@ To use other host ports: `CONTROLLER_PORT=9090 WEB_PORT=3001 docker compose up -
 docker compose ps
 ```
 
-All 16 containers should be `Up`, and these `(healthy)`: `etcd1-3`, `postgres1-2`, `pg-proxy`,
-`controller1-2`, `gateway`, `worker1-4`. (`client`, `web` and `pg-backup` have no health check.)
+All 17 containers should be `Up`, and these `(healthy)`: `etcd1-3`, `postgres1-2`, `pg-proxy`,
+`controller1-2`, `gateway`, `worker1-4`. (`client`, `web`, `pg-backup` and `demo-runner` have no health check.)
 
 ```bash
 API=http://localhost:8082/api/v1
@@ -115,8 +116,9 @@ docker exec postgres1 patronictl -c /etc/patroni/patroni.yml list
 # one node "Leader / running", the other "Sync Standby / streaming"
 ```
 
-Then open the web UI at **http://localhost:3000**. It shows the active controller, the 4 workers, the
-replication status, the objects and the live event log.
+Then open the web UI at **http://localhost:3000**. It shows summary stats, which controller / PostgreSQL node
+is active, the 4 workers, the objects (click one for its chunk map and metadata), the live event log, and at
+the bottom the **Demo scenarios** buttons.
 
 ### 2.4 Everyday commands
 
@@ -135,7 +137,20 @@ replication status, the objects and the live event log.
 
 ## 3. Demonstrations
 
-### 3.1 Automated demo (recommended)
+### 3.1 From the web UI (one button per scenario)
+
+Open **http://localhost:3000** and scroll to **Demo scenarios**. Each card has a **▶ Run** button that runs that
+scenario; its narrated output streams into the console below the cards, with the PASS/FAIL result on the card.
+Only one scenario runs at a time. While it runs, the panels above change live: e.g. scenario 5 turns worker2
+red with a re-replication countdown, scenario 9 swaps ACTIVE/STANDBY between the controllers, scenario 10 swaps
+PRIMARY/REPLICA between the PostgreSQL nodes.
+
+The buttons are served by the `demo-runner` container, which runs `demo.sh --only N` (only the fixed scenario
+numbers 1-10). Because the scenarios stop and kill containers, it has access to the Docker socket. For that
+reason the web UI is published on **127.0.0.1 only** by default; set `WEB_BIND=0.0.0.0` to expose it on the
+network (only on a trusted network).
+
+### 3.2 Automated demo from the terminal
 
 `demo.sh` runs every case below with narration and PASS/FAIL checks, against the running stack:
 
@@ -162,7 +177,7 @@ Section 8 uses the sample files in `demo-files/` and generates any that are miss
 | 9 | Controller failover | `docker kill` the active controller while a client polls the API: the standby takes over (~5 s gap), stored objects still download byte-identical, uploads work, no worker is marked DOWN. The killed controller restarts as the standby. |
 | 10 | Metadata store failover | `docker kill` the PostgreSQL primary while a client polls the API: the replica is promoted (~17 s gap, fast 503s meanwhile), stored objects still download byte-identical, uploads work, no worker is marked DOWN, the killed node rejoins as a replica; a metadata backup is taken. |
 
-### 3.2 Step-by-step demo by hand
+### 3.3 Step-by-step demo by hand
 
 The same cases, one command at a time, for showing the system live. Run them in order in one terminal from
 the project directory; keep the web UI (http://localhost:3000) open next to it to watch workers and events
@@ -586,6 +601,7 @@ The grace period stops a short restart from triggering a full copy. All repair w
 | Variable (compose / controller env)          | Default   | Meaning |
 |----------------------------------------------|-----------|---------|
 | `CONTROLLER_PORT`, `WEB_PORT`                | 8082, 3000| host ports |
+| `WEB_BIND`                                   | 127.0.0.1 | host address the web UI is published on |
 | `STORE_CHUNK_SIZE`                           | 1048576   | chunk size in bytes |
 | `STORE_REPLICATION_FACTOR`                   | 2         | copies per chunk |
 | `STORE_HEARTBEAT_TIMEOUT_MS`                 | 10000     | no heartbeat for this long → DOWN |
@@ -624,6 +640,7 @@ postgres/     PostgreSQL + Patroni image (primary election through etcd, streami
 pg-proxy/     HAProxy config: routes database connections to the current primary
 pg-backup/    periodic pg_dump backups
 scripts/      restore-metadata.sh
+demo-runner/  runs demo scenarios for the web UI buttons; infrastructure status
 demo.sh       scripted demonstrations
 ```
 

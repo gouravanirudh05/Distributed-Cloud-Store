@@ -1,4 +1,5 @@
-// Object Store Console - talks only to the controller's REST API (/api/v1/...), proxied by nginx.
+// Object Store Console - talks to the controller's REST API (/api/v1/..., via the gateway) and to the
+// demo runner (/runner/...) for the infrastructure panel and the demo scenario buttons; both proxied by nginx.
 "use strict";
 
 const API = "/api/v1";
@@ -76,7 +77,8 @@ const EVENT_CLASS = {
   UPLOAD_FAILED: "bad", WORKER_RECOVERING: "warn", WORKER_REGISTERED: "info", CHUNK_UNDER_REPLICATED: "warn",
   UPLOAD_DEGRADED: "warn", WORKER_UP: "ok", CHUNK_REPAIRED: "ok", CHUNK_RE_REPLICATED: "ok",
   REPLICATION_RESTORED: "ok", OBJECT_UPLOADED: "info", CHUNK_SURPLUS_REMOVED: "info", SCRUB_COMPLETED: "info",
-  CONTROLLER_FAILOVER: "warn", CONTROLLER_ELECTED: "info",
+  CONTROLLER_FAILOVER: "warn", CONTROLLER_ELECTED: "info", METADATA_STORE_RECOVERED: "warn", WORKER_REJECTED: "bad",
+  OBJECT_DELETED: "neutral", METADATA_UPDATED: "info", ORPHAN_REMOVED: "neutral",
 };
 
 // ---------------------------------------------------------------- cluster
@@ -87,13 +89,17 @@ async function refreshCluster() {
       api("/admin/workers"), api("/admin/replication?limit=0"), api("/admin/events?limit=60"),
       api("/admin/controller").catch(() => null),
     ]);
-    $("active-controller").textContent = ctl ? `${ctl.instanceId} (term ${ctl.term})` : "?";
+    $("active-controller").textContent = ctl ? `${ctl.instanceId} · term ${ctl.term}` : "?";
     state.workers = workers;
+    const up = workers.filter((w) => w.status === "UP").length;
+    $("stat-workers").textContent = `${up} / ${workers.length}`;
+    $("stat-workers-sub").textContent = up === workers.length ? "all heartbeating" :
+      workers.filter((w) => w.status !== "UP").map((w) => `${w.workerId} ${w.status}`).join(", ");
     renderWorkers(workers);
     renderReplication(rep);
     renderEvents(events);
   } catch (e) {
-    $("active-controller").textContent = "none (failover in progress?)";
+    $("active-controller").textContent = "none (failover?)";
     $("cluster-status").replaceWith(Object.assign(pill("CONTROLLER UNREACHABLE"), { id: "cluster-status", className: "pill bad" }));
   }
 }
@@ -126,10 +132,16 @@ function renderReplication(rep) {
   const p = pill(status);
   p.id = "cluster-status";
   $("cluster-status").replaceWith(p);
-  $("replication-line").textContent =
-    `${rep.totalChunks} chunks · ${rep.healthyChunks} with exactly ${rep.replicationFactor} live copies · ` +
-    `${rep.underReplicatedChunks} under-replicated · ${rep.overReplicatedChunks} over-replicated · ` +
-    `${rep.unavailableChunks} unavailable`;
+  $("stat-replication").replaceChildren(pill(status));
+  $("stat-chunks").textContent = rep.totalChunks.toLocaleString();
+  $("stat-copies").textContent = `× ${rep.replicationFactor} copies on different workers`;
+  const problems = [
+    rep.underReplicatedChunks && `${rep.underReplicatedChunks} under-replicated`,
+    rep.overReplicatedChunks && `${rep.overReplicatedChunks} over-replicated`,
+    rep.unavailableChunks && `${rep.unavailableChunks} unavailable`,
+  ].filter(Boolean);
+  $("replication-line").textContent = problems.length ? problems.join(" · ")
+    : `every chunk has exactly ${rep.replicationFactor} live copies`;
 }
 
 function renderEvents(events) {
@@ -169,6 +181,7 @@ async function refreshObjects() {
     state.totalPages = Math.max(1, page.totalPages);
     if (state.page >= state.totalPages && state.page > 0) { state.page = state.totalPages - 1; return refreshObjects(); }
     $("objects-count").textContent = `${page.totalItems} object${page.totalItems === 1 ? "" : "s"}`;
+    $("stat-objects").textContent = page.totalItems.toLocaleString();
     $("page-label").textContent = `page ${state.page + 1} / ${state.totalPages}`;
     $("prev").disabled = state.page === 0;
     $("next").disabled = state.page >= state.totalPages - 1;
@@ -398,12 +411,180 @@ $("delete-btn").addEventListener("click", async () => {
   }
 });
 
+
+// ---------------------------------------------------------------- infrastructure (from the demo runner)
+
+const ROLE_CLASS = {
+  ACTIVE: "ok", PRIMARY: "ok", ROUTING: "ok", HEALTHY: "ok",
+  STANDBY: "info", "SYNC REPLICA": "info", REPLICA: "info", STARTING: "warn",
+  "NO ACTIVE CONTROLLER": "bad", "NO PRIMARY": "bad", UNHEALTHY: "bad", DOWN: "bad",
+};
+
+function nodeRow(n, detail) {
+  const cls = ROLE_CLASS[n.role] || "neutral";
+  return el("div", { class: "node " + cls },
+    el("span", { class: "node-name", text: n.name }, detail ? el("span", { class: "node-detail", text: detail }) : null),
+    el("span", { class: "pill " + cls, text: n.role }));
+}
+
+async function refreshInfra() {
+  try {
+    const res = await fetch("/runner/infra");
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const i = await res.json();
+    $("infra-note").hidden = true;
+    $("infra-control").replaceChildren(
+      nodeRow(i.gateway, "client entry point"),
+      ...i.controllers.map((c) => nodeRow(c, c.role === "ACTIVE" && c.term ? `term ${c.term}` : null)));
+    $("infra-db").replaceChildren(
+      nodeRow(i.pgProxy, "routes to primary"),
+      ...i.postgres.map((p) => nodeRow(p, p.timeline ? `timeline ${p.timeline}` : null)));
+    $("infra-etcd").replaceChildren(...i.etcd.map((e) => nodeRow(e)));
+  } catch (e) {
+    $("infra-note").hidden = false;
+  }
+}
+
+// ---------------------------------------------------------------- demo scenarios
+
+const runner = { scenarios: [], running: null, consoleN: null, next: 0, available: true };
+
+function fmtSeconds(s) {
+  return s >= 60 ? `~${Math.round(s / 60)} min` : `~${s} s`;
+}
+
+function scenarioStatusPill(s) {
+  if (s.status === "running") return el("span", { class: "pill info running", text: `running · ${s.passed} passed` });
+  if (s.status === "passed") return el("span", { class: "pill ok", text: `passed ${s.passed}/${s.passed + s.failed}` });
+  if (s.status === "failed") return el("span", { class: "pill bad", text: `failed ${s.failed} of ${s.passed + s.failed}` });
+  return el("span", { class: "pill neutral", text: "not run yet" });
+}
+
+function renderScenarios() {
+  const busy = runner.running != null;
+  $("scenario-list").replaceChildren(...runner.scenarios.map((s) => el("div", {
+    class: "scenario" + (s.status === "running" ? " running" : "") + (runner.consoleN === s.n ? " selected" : ""),
+  },
+    el("div", { class: "scenario-head" },
+      el("span", { class: "scenario-num", text: String(s.n) }),
+      el("span", { class: "scenario-title", text: s.title })),
+    el("p", { class: "scenario-desc", text: s.description }),
+    el("div", { class: "scenario-foot" },
+      scenarioStatusPill(s),
+      el("div", { class: "actions" },
+        s.status !== "idle" ? el("button", { class: "ghost small", text: "Log", onclick: () => openConsole(s.n) }) : null,
+        el("button", {
+          class: "primary small", text: s.status === "running" ? "Running…" : "▶ Run",
+          disabled: busy || !runner.available ? "" : null,
+          title: busy ? `Scenario ${runner.running} is running` : `Run scenario ${s.n} (${fmtSeconds(s.estimatedSeconds)})`,
+          onclick: () => runScenario(s.n),
+        }))),
+    el("span", { class: "scenario-time", text: `takes ${fmtSeconds(s.estimatedSeconds)}` }))));
+  const rs = $("runner-status");
+  if (!runner.available) { rs.className = "pill bad"; rs.textContent = "runner unavailable"; }
+  else if (busy) { rs.className = "pill info running"; rs.textContent = `scenario ${runner.running} running`; }
+  else { rs.className = "pill ok"; rs.textContent = "ready"; }
+}
+
+async function refreshScenarios() {
+  try {
+    const res = await fetch("/runner/scenarios");
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const body = await res.json();
+    runner.available = true;
+    const finished = runner.running != null && body.running !== runner.running ? runner.running : null;
+    runner.scenarios = body.scenarios;
+    runner.running = body.running;
+    if (finished != null && finished === runner.consoleN) {
+      pollLog();   // fetch the final lines and the result
+      const s = body.scenarios.find((x) => x.n === finished);
+      if (s) toast(`Scenario ${finished} ${s.status}: ${s.passed} passed, ${s.failed} failed`, s.status !== "passed");
+    }
+  } catch (e) {
+    runner.available = false;
+  }
+  renderScenarios();
+}
+
+async function runScenario(n) {
+  try {
+    const res = await fetch(`/runner/run/${n}`, { method: "POST" });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) return toast(body.error || "Could not start scenario " + n, true);
+    toast(`Scenario ${n} started`);
+    runner.running = n;
+    openConsole(n);
+    refreshScenarios();
+  } catch (e) {
+    toast("Could not reach the demo runner", true);
+  }
+}
+
+function openConsole(n) {
+  runner.consoleN = n;
+  runner.next = 0;
+  $("console-body").replaceChildren();
+  const s = runner.scenarios.find((x) => x.n === n);
+  $("console-title").textContent = `Scenario ${n}${s ? " · " + s.title : ""}`;
+  $("console").hidden = false;
+  $("console").scrollIntoView({ behavior: "smooth", block: "nearest" });
+  renderScenarios();
+  pollLog();
+}
+
+function lineClass(line) {
+  const t = line.trimStart();
+  if (t.startsWith("PASS ")) return "l-pass";
+  if (t.startsWith("FAIL ")) return "l-fail";
+  if (t.startsWith("===")) return "l-section";
+  if (t.startsWith("$ ")) return "l-cmd";
+  if (t.startsWith("# ")) return "l-say";
+  if (t.startsWith("waiting for")) return "l-wait";
+  return "";
+}
+
+async function pollLog() {
+  const n = runner.consoleN;
+  if (n == null) return;
+  try {
+    const res = await fetch(`/runner/log/${n}?from=${runner.next}`);
+    const log = await res.json();
+    if (runner.consoleN !== n) return;
+    const body = $("console-body");
+    const atBottom = body.scrollHeight - body.scrollTop - body.clientHeight < 40;
+    body.querySelector(".partial")?.remove();
+    for (const line of log.lines || []) body.append(el("span", { class: lineClass(line), text: line + "\n" }));
+    if (log.partial) body.append(el("span", { class: "partial " + lineClass(log.partial), text: log.partial }));
+    runner.next = log.next || 0;
+    if (atBottom) body.scrollTop = body.scrollHeight;
+    const secs = log.startedAt ? Math.round(((log.finishedAt || Date.now() / 1000) - log.startedAt)) : 0;
+    $("console-dot").className = "dot " + (log.status || "");
+    $("console-meta").textContent = log.status === "idle" ? "not run yet"
+      : `${log.status} · ${secs} s · ${log.passed} passed${log.failed ? ", " + log.failed + " failed" : ""}`;
+    if (log.status !== "running" && runner.running === n) refreshScenarios();
+  } catch (e) { /* runner restarting; try again */ }
+}
+
+$("console-close").addEventListener("click", () => {
+  runner.consoleN = null;
+  $("console").hidden = true;
+  renderScenarios();
+});
+
 // ---------------------------------------------------------------- polling
 
 refreshCluster();
 refreshObjects();
 if (location.hash.startsWith("#object=")) openDetail(decodeURIComponent(location.hash.slice(8)));  // deep link
+refreshInfra();
+refreshScenarios();
 setInterval(refreshCluster, 2000);
+setInterval(refreshInfra, 2000);
+setInterval(refreshScenarios, 3000);
+setInterval(() => {
+  const s = runner.scenarios.find((x) => x.n === runner.consoleN);
+  if (runner.consoleN != null && (runner.running === runner.consoleN || (s && s.status === "running"))) pollLog();
+}, 700);
 setInterval(refreshObjects, 5000);
 setInterval(() => {
   if (state.detailId && !$("detail").hidden) {
