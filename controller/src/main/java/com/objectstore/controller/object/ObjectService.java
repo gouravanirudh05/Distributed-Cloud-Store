@@ -19,6 +19,7 @@ import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Sort;
 import org.springframework.http.InvalidMediaTypeException;
 import org.springframework.http.MediaType;
+import org.springframework.dao.OptimisticLockingFailureException;
 import org.springframework.http.MediaTypeFactory;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.support.TransactionTemplate;
@@ -33,6 +34,7 @@ import java.util.*;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
+import java.util.concurrent.ThreadLocalRandom;
 
 /**
  * Object operations behind the public REST API. The controller is the only component that knows where
@@ -40,6 +42,9 @@ import java.util.concurrent.Future;
  */
 @Service
 public class ObjectService {
+
+    /** Attempts for a metadata PATCH that keeps losing the optimistic-lock race. */
+    private static final int PATCH_RETRIES = 12;
 
     private static final Logger log = LoggerFactory.getLogger(ObjectService.class);
     private static final int MAX_NAME_LENGTH = 1024;
@@ -272,13 +277,28 @@ public class ObjectService {
 
     public ObjectMetadata patchMetadata(String id, JsonNode body) {
         Map<String, String> patch = CustomMetadata.parsePatch(body);
-        Boolean changed = tx.execute(s -> {
-            ObjectRecord rec = objects.findById(id).orElseThrow(() -> ApiException.objectNotFound(id));
-            requireState(rec, "modified");
-            boolean c = CustomMetadata.applyPatch(rec.getCustomMetadata(), patch);
-            if (c) rec.setLastModified(Instant.now());
-            return c;
-        });
+        Boolean changed = null;
+        for (int attempt = 1; changed == null; attempt++) {
+            try {
+                changed = tx.execute(s -> {
+                    ObjectRecord rec = objects.findById(id).orElseThrow(() -> ApiException.objectNotFound(id));
+                    requireState(rec, "modified");
+                    boolean c = CustomMetadata.applyPatch(rec.getCustomMetadata(), patch);
+                    if (c) rec.setLastModified(Instant.now());
+                    return c;
+                });
+            } catch (OptimisticLockingFailureException e) {
+                // Another request changed the object first. A merge patch can simply be re-applied to the new
+                // state, so retry a few times; only a persistent conflict is reported to the client (409).
+                if (attempt >= PATCH_RETRIES) throw e;
+                try {
+                    Thread.sleep(ThreadLocalRandom.current().nextInt(5, 25) * attempt);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw e;
+                }
+            }
+        }
         if (Boolean.TRUE.equals(changed)) {
             events.record(EventType.METADATA_UPDATED, null, id, null,
                     "Custom metadata updated (no object data re-uploaded): " + patch);

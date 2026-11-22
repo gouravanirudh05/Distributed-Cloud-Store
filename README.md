@@ -91,6 +91,7 @@ Ports can be changed with `CONTROLLER_PORT=… WEB_PORT=… docker compose up -d
 | 5 | Worker failure            | `docker stop worker2`: DOWN detected, status DEGRADED, object still downloads correctly. After 30 s, chunks are re-replicated (HEALTHY while worker2 is down). `docker start worker2`: chunks verified, worker UP, temporary copies trimmed, exactly 2 copies per chunk. |
 | 6 | Data integrity            | Corrupt a chunk file with `dd`: the download still returns the original bytes and the bad copy is rewritten. A corrupted secondary copy is found by `POST /admin/scrub`. With both copies corrupted the API answers 503 instead of returning bad data. |
 | 7 | Other API operations      | List, delete (204 then 404), 400 errors. |
+| 8 | File formats              | Images, video, audio, ZIP/7z/tar.gz/xz, PDF, text, ELF binary, empty file, Unicode name: each uploaded, downloaded, compared byte for byte (samples are generated if missing; needs ffmpeg/zip for some). |
 
 ### Doing it by hand
 

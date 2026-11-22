@@ -9,11 +9,12 @@
 #    5. Worker failure          docker stop worker2 / docker start worker2, before/during/after
 #    6. Data integrity          corrupt stored data on purpose; detection, safe reads, repair
 #    7. Other API operations    list, delete, error responses
+#    8. File formats            images, video, audio, archives, PDF, raw binary: all byte-identical
 #
 #  Usage:  ./demo.sh [--fresh] [--pause] [--only N]
 #     --fresh   wipe all data (docker compose down -v) and rebuild/start the stack first
 #     --pause   wait for <Enter> between sections (for a live presentation)
-#     --only N  run only section N (1-7); objects it depends on are uploaded automatically
+#     --only N  run only section N (1-8); objects it depends on are uploaded automatically
 #  Needs: docker (compose v2), curl, jq, sha256sum.  Exit code = number of failed checks.
 # =============================================================================================
 set -uo pipefail
@@ -353,6 +354,84 @@ if want 7; then
   check "upload without the 'file' field returns 400 with a JSON message" [ "$code" = 400 ]
   code=$(curl -s -o "$FILES/.err.json" -w '%{http_code}' -F "file=@$FILES/hello.txt" -F 'metadata=not-json' "$API/objects"); echo "    HTTP $code $(cat "$FILES/.err.json")"
   check "invalid metadata JSON returns 400" [ "$code" = 400 ]
+fi
+
+# ------------------------------------------------------------------------------------ 8
+if want 8; then
+  section "8. File formats: images, video, audio, archives, documents and raw binary"
+  say "Objects are opaque bytes: every format must come back bit-for-bit identical, with the right content type"
+  gen_ffmpeg() { command -v ffmpeg >/dev/null && ffmpeg -loglevel error -y "$@"; }
+  gen_file() { # gen_file <name>: create a missing sample file; returns 1 if it cannot be made here
+    local f="$FILES/$1"
+    case "$1" in
+      photo.png|photo.jpg|photo.webp) gen_ffmpeg -f lavfi -i "nullsrc=s=1200x900,geq=random(1)*255:random(2)*255:random(3)*255" -frames:v 1 "$f" ;;
+      video.mp4)           gen_ffmpeg -f lavfi -i testsrc=duration=20:size=640x480:rate=30 -c:v libx264 "$f" ;;
+      big_noise_video.mp4) gen_ffmpeg -f lavfi -i "nullsrc=s=640x480:r=30,geq=random(1)*255:128:128" -t 10 -c:v libx264 -crf 18 "$f" ;;
+      audio.mp3)           gen_ffmpeg -f lavfi -i sine=frequency=880:duration=30 "$f" ;;
+      audio.wav)           gen_ffmpeg -f lavfi -i sine=frequency=220:duration=10 "$f" ;;
+      notes.txt)           for _ in $(seq 50000); do echo 'héllo wörld 日本語'; done > "$f" ;;
+      archive.zip)         command -v zip >/dev/null && zip -q "$f" "$FILES/notes.txt" ;;
+      archive.tar.gz)      tar czf "$f" -C "$FILES" notes.txt ;;
+      archive.7z)          command -v 7z >/dev/null && 7z a -bso0 "$f" "$FILES/notes.txt" ;;
+      notes.txt.xz)        command -v xz >/dev/null && xz -k -c "$FILES/notes.txt" > "$f" ;;
+      spec.pdf)            cp Mini_Distributed_Cloud_Object_Store.pdf "$f" ;;
+      random.bin)          head -c 5255225 /dev/urandom > "$f" ;;
+      exact_2MiB.bin)      head -c 2097152 /dev/urandom > "$f" ;;
+      empty.dat)           : > "$f" ;;
+      ls-elf-binary)       cp /bin/ls "$f" ;;
+      "résumé final (v2) 日本.bin") cp "$FILES/random.bin" "$f" ;;
+      *) return 1 ;;
+    esac 2>/dev/null && [ -f "$f" ]
+  }
+  # name | expected content type (the extension guess is used when the client sends none)
+  FORMATS=(
+    "photo.png|image/png" "photo.jpg|image/jpeg" "photo.webp|image/webp"
+    "video.mp4|video/mp4" "big_noise_video.mp4|video/mp4"
+    "audio.mp3|audio/mpeg" "audio.wav|audio/x-wav"
+    "archive.zip|application/zip" "archive.7z|application/x-7z-compressed" "notes.txt.xz|application/x-xz"
+    "archive.tar.gz|application/octet-stream"
+    "spec.pdf|application/pdf" "notes.txt|text/plain"
+    "random.bin|application/octet-stream" "exact_2MiB.bin|application/octet-stream"
+    "ls-elf-binary|application/octet-stream" "empty.dat|application/octet-stream"
+    "résumé final (v2) 日本.bin|application/octet-stream"
+  )
+  printf '    %-30s %10s  %-32s %6s  %s\n' FILE BYTES CONTENT-TYPE CHUNKS RESULT
+  FMT_IDS=()
+  for entry in "${FORMATS[@]}"; do
+    name="${entry%%|*}"; want_ct="${entry##*|}"; f="$FILES/$name"
+    if [ ! -f "$f" ] && ! gen_file "$name"; then
+      echo "    ${DIM}skipped $name (not present and cannot be generated here)${N}"; continue
+    fi
+    size=$(stat -c%s "$f"); want_chunks=$(( (size + 1048575) / 1048576 ))
+    out=$(upload "$f"); code=$(echo "$out" | tail -n1); body=$(echo "$out" | head -n -1)
+    id=$(echo "$body" | jq -r .objectId); FMT_IDS+=("$id")
+    rm -f "$FILES/.fmt.out"
+    curl -s -D "$FILES/.headers" -o "$FILES/.fmt.out" "$API/objects/$id"
+    ct=$(echo "$body" | jq -r .contentType); chunks=$(echo "$body" | jq -r .chunkCount)
+    hdr_sum=$(grep -i '^x-checksum-sha256:' "$FILES/.headers" | tr -d '\r' | awk '{print $2}')
+    ok=1
+    [ "$code" = 201 ] && [ "$(echo "$body" | jq -r .name)" = "$name" ] || ok=0
+    [ "$ct" = "$want_ct" ] && [ "$chunks" = "$want_chunks" ] || ok=0
+    cmp -s "$f" "$FILES/.fmt.out" && [ "$hdr_sum" = "$(sha "$f")" ] || ok=0
+    meta "$id" | jq -e '.chunks | all(.replicas | length == 2)' >/dev/null || ok=0
+    [ "$ok" = 1 ] && res="identical" || res="MISMATCH"
+    printf '    %-30s %10s  %-32s %6s  %s\n' "$name" "$size" "$ct" "$chunks" "$res"
+    check "$name: $size B, $ct, $chunks chunk(s) x 2 copies, download byte-identical, name and checksum header correct" [ "$ok" = 1 ]
+  done
+  say "a downloaded archive and a downloaded video are still usable files (not just equal bytes):"
+  if [ -f "$FILES/.fmt.out" ] && command -v unzip >/dev/null && [ -f "$FILES/archive.zip" ]; then
+    id=$(upload "$FILES/archive.zip" | head -n -1 | jq -r .objectId); FMT_IDS+=("$id")
+    curl -s -o "$FILES/.fmt.zip" "$API/objects/$id"
+    check "downloaded ZIP passes 'unzip -t'" unzip -tq "$FILES/.fmt.zip"
+  fi
+  if command -v ffprobe >/dev/null && [ -f "$FILES/video.mp4" ]; then
+    id=$(upload "$FILES/video.mp4" | head -n -1 | jq -r .objectId); FMT_IDS+=("$id")
+    curl -s -o "$FILES/.fmt.mp4" "$API/objects/$id"
+    check "downloaded MP4 is decodable by ffprobe" ffprobe -v error -i "$FILES/.fmt.mp4"
+  fi
+  for id in "${FMT_IDS[@]}"; do curl -s -o /dev/null -X DELETE "$API/objects/$id"; done
+  rm -f "$FILES/.fmt.out" "$FILES/.fmt.zip" "$FILES/.fmt.mp4"
+  pause
 fi
 
 # ------------------------------------------------------------------------------------ summary
